@@ -1,4 +1,5 @@
 #include <vector>
+#include <SDL3_image/SDL_image.h>
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -42,10 +43,11 @@ public:
             layout(location = 0) in vec2 v_TexCoord;
             layout(location = 0) out vec4 f_Color;
 
+            uniform vec4 u_UV;
             uniform sampler2D u_Texture;
 
             void main() {
-                f_Color = texture(u_Texture, v_TexCoord);
+                f_Color = texture(u_Texture, v_TexCoord * u_UV.zw + u_UV.xy);
             }
         )GLSL";
         glShaderSource(fragmentShader.get(), 1, &fragmentShaderSource, nullptr);
@@ -91,7 +93,35 @@ public:
     void setProjectionViewModelMatrix(const glm::mat4 &value) const {
         glUniformMatrix4fv(glGetUniformLocation(this->program.get(), "u_ProjectionViewModelMatrix"), 1, false, glm::value_ptr(value));
     }
+    void setUV(const glm::vec4 &value) const {
+        glUniform4fv(glGetUniformLocation(this->program.get(), "u_UV"), 1, glm::value_ptr(value));
+    }
 };
+
+bool loadTexture(const char *path, GLuint destination) {
+    SDL_Surface *surface = IMG_Load(path);
+    if (surface == nullptr) {
+        fprintf(stderr, "Failed to load texture: %s\n", SDL_GetError());
+        return false;
+    }
+
+    SDL_Surface *convertedSurface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+    if (convertedSurface == nullptr) {
+        fprintf(stderr, "Failed to convert surface: %s\n", SDL_GetError());
+        SDL_DestroySurface(surface);
+        return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, destination);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, convertedSurface->w, convertedSurface->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, convertedSurface->pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    SDL_DestroySurface(convertedSurface);
+    SDL_DestroySurface(surface);
+    return true;
+}
 
 int main() {
     const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
@@ -139,6 +169,12 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+    gl::Texture atlasTexture = gl::Texture();
+    if (!loadTexture("assets/atlas.png", atlasTexture.get())) {
+        printf("Failed to load texture atlas\n");
+        return -1;
+    }
+
     gl::VertexArrayObject vertexArrayObject = gl::VertexArrayObject();
     glBindVertexArray(vertexArrayObject.get());
     gl::VertexBufferObject vertexBufferObject = gl::VertexBufferObject();
@@ -149,6 +185,13 @@ int main() {
     }
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+
+    constexpr size_t gridWidth = 10, gridHeight = 20;
+    std::array<std::array<uint8_t, gridWidth>, gridHeight> grid = std::array<std::array<uint8_t, gridWidth>, gridHeight>();
+    for (uint32_t i = 0; i < 20; i++) {
+        size_t row = rand() % gridHeight, col = rand() % gridWidth;
+        grid[row][col] = rand() % 7 + 1;
+    }
 
     Uint64 lastTime = SDL_GetTicksNS();
     bool running = true;
@@ -182,10 +225,25 @@ int main() {
 
         glClear(GL_COLOR_BUFFER_BIT);
         basicShader.bind();
-        basicShader.setProjectionViewModelMatrix(projectionViewMatrix);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, whiteTexture.get());
-        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glBindTexture(GL_TEXTURE_2D, atlasTexture.get());
+
+        const float cellSize = 2.0f / static_cast<float>(gridHeight);
+        const float gridX = (aspectRatio * 2.0f - static_cast<float>(gridWidth) * cellSize) * 0.5f;
+        for (size_t row = 0; row < gridHeight; row++) {
+            for (size_t col = 0; col < gridWidth; col++) {
+                if (grid[row][col] == 0) { continue; }
+                const float x = -aspectRatio + gridX + col * cellSize;
+                const float y = -1.0f + row * cellSize;
+                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
+                basicShader.setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+                const float uvSize = 1.0f / 3.0f;
+                const float uvX = std::fmodf(static_cast<float>(grid[row][col] - 1), 3.0f) * uvSize;
+                const float uvY = std::floorf(static_cast<float>(grid[row][col] - 1) / 3.0f) * uvSize;
+                basicShader.setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            }
+        };
 
         SDL_GL_SwapWindow(window.get());
     }
