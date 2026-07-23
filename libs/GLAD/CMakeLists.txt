@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
+project(GLAD)
+set(CMAKE_C_STANDARD 99)
+add_library(${PROJECT_NAME} STATIC src/gl.c)
+target_include_directories(${PROJECT_NAME} PUBLIC include)
