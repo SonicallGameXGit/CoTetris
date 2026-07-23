@@ -174,26 +174,77 @@ public:
 private:
     std::array<std::array<uint8_t, Map::width>, Map::height> grid;
     std::optional<Piece> piece;
+    bool pieceLanded = false;
+    bool justSpawnedPiece = false;
 
-    void resolvePieceCollisions() {
-        // TODO: For now it just checks the map bounds, but it should also check for collisions with other pieces.
-        if (!this->piece.has_value()) { return; }
+    bool checkFuturePieceCollisions(const int16_t x, const int16_t y) {
+        if (!this->piece.has_value()) { return false; }
         const glm::u8vec4 &bounds = this->piece->getBounds();
-        if (this->piece->x + bounds.x < 0) {
-            this->piece->x = -bounds.x;
+        
+        if (
+            x + bounds.x < 0 ||
+            x + bounds.z >= Map::width ||
+            y + bounds.y < 0 ||
+            y + bounds.w >= Map::height
+        ) { return true; }
+
+        for (size_t row = bounds.y; row <= bounds.w; row++) {
+            for (size_t col = bounds.x; col <= bounds.z; col++) {
+                if (this->piece->getCell(row, col) == 0) { continue; }
+                const size_t mapRow = y + row;
+                const size_t mapCol = x + col;
+                if (this->grid[mapRow][mapCol] != 0) { return true; }
+            }
         }
-        if (this->piece->x + bounds.z >= Map::width) {
-            this->piece->x = Map::width - 1 - bounds.z;
+        return false;
+    }
+    void resolvePieceCollisions() {
+        if (!this->piece.has_value()) { return; }
+        if (!this->checkFuturePieceCollisions(this->piece->x, this->piece->y)) { return; }
+
+        const std::array<glm::i16vec2, 8> fixes = {{
+            // First of all, try to move it left or right (the most common case).
+            // ! It must stay first, because the user can't control the piece's vertical movement, but he can easily try to move it horizontally, while being able to move out vertically because of wrong algorithm.
+            {  1,  0 },
+            { -1,  0 },
+            // Secondly, try to move it back up or bring down (the second most common case).
+            {  0,  1 },
+            {  0, -1 },
+            // Thirdly, try to move it diagonally (the least common cases).
+            // [Up]
+            {  1,  1 },
+            { -1,  1 },
+            // [Down]
+            {  1, -1 },
+            { -1, -1 },
+        }};
+
+        for (uint8_t i = 1; i <= 2; i++) {
+            for (const glm::i16vec2 &fix : fixes) {
+                if (!this->checkFuturePieceCollisions(this->piece->x + fix.x * i, this->piece->y + fix.y * i)) {
+                    this->piece->x += fix.x * i;
+                    this->piece->y += fix.y * i;
+                    return;
+                }
+            }
         }
-        if (this->piece->y + bounds.y < 0) {
-            this->piece->y = -bounds.y;
-        }
-        if (this->piece->y + bounds.w >= Map::height) {
-            this->piece->y = Map::height - 1 - bounds.w;
-        }
+        
+        // if (this->piece->x + bounds.x < 0) {
+        //     this->piece->x = -bounds.x;
+        // }
+        // if (this->piece->x + bounds.z >= Map::width) {
+        //     this->piece->x = Map::width - 1 - bounds.z;
+        // }
+        // if (this->piece->y + bounds.y < 0) {
+        //     this->piece->y = -bounds.y;
+        //     this->pieceLanded = true;
+        // }
+        // if (this->piece->y + bounds.w >= Map::height) {
+        //     this->piece->y = Map::height - 1 - bounds.w;
+        // }
     }
 public:
-    Map() : grid(), piece(std::nullopt) {}
+    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {}
     ~Map() = default;
 
     void draw(const BasicShader &shader, GLuint atlasTexture, const glm::mat4 &projectionViewMatrix, float aspectRatio) const {
@@ -238,8 +289,11 @@ public:
     }
 
     void showPiece(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
-        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, /* rand() % 4 */ 0);
+        if (this->piece.has_value()) { return; }
+        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
         this->piece->copy(prefab);
+        // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
+        this->justSpawnedPiece = true;
     }
     void hidePiece() {
         this->piece = std::nullopt;
@@ -260,9 +314,54 @@ public:
         this->resolvePieceCollisions();
     }
     void tick() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->y--;
-        this->resolvePieceCollisions();
+        if (this->piece.has_value()) {
+            int16_t oldPieceY = this->piece->y;
+            this->piece->y--;
+            if (this->checkFuturePieceCollisions(this->piece->x, this->piece->y)) {
+                if (this->justSpawnedPiece) {
+                    // ! Dead, for now, just reset the map.
+                    this->grid.fill({});
+                    this->hidePiece();
+                    return;
+                }
+                this->piece->y++;
+                this->pieceLanded = true;
+            }
+        }
+        this->justSpawnedPiece = false;
+
+        if (this->pieceLanded) {
+            this->pieceLanded = false;
+            for (size_t row = 0; row < Piece::height; row++) {
+                for (size_t col = 0; col < Piece::width; col++) {
+                    if (this->piece->getCell(row, col) == 0) { continue; }
+                    const size_t mapRow = this->piece->y + row;
+                    const size_t mapCol = this->piece->x + col;
+                    this->grid[mapRow][mapCol] = this->piece->getCell(row, col);
+                }
+            }
+            this->hidePiece();
+        }
+
+        bool done = false;
+        while (!done) {
+            done = true;
+            for (size_t row = 0; row < Map::height; row++) {
+                uint8_t columnsFilled = 0;
+                for (size_t col = 0; col < Map::width; col++) {
+                    if (this->grid[row][col] != 0) {
+                        columnsFilled++;
+                    }
+                }
+                if (columnsFilled < Map::width) { continue; }
+    
+                for (size_t r = row; r < Map::height - 1; r++) {
+                    this->grid[r] = this->grid[r + 1];
+                }
+                this->grid[Map::height - 1].fill(0);
+                done = false; // If we've found one filled row, there's a chance of finding another one, but if we didn't found any, there's no chance of finding one, of course.
+            }
+        }
     }
 };
 
@@ -329,46 +428,47 @@ int main() {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
 
+    // ! Every next line of data = +Y, not -Y, so shapes should be built upside down and flipped horizontally to be correct.
     const std::array<std::array<std::array<uint8_t, Piece::width>, Piece::height>, 7> defaultShapes = {{
         {{ // I
-            { 0, 0, 1, 0 },
-            { 0, 0, 1, 0 },
-            { 0, 0, 1, 0 },
-            { 0, 0, 1, 0 },
+            { 0, 5, 0, 0 },
+            { 0, 5, 0, 0 },
+            { 0, 5, 0, 0 },
+            { 0, 5, 0, 0 },
         }},
         {{ // J
-            { 0, 0, 1, 0 },
-            { 0, 0, 1, 0 },
-            { 0, 1, 1, 0 },
+            { 0, 6, 6, 0 },
+            { 0, 6, 0, 0 },
+            { 0, 6, 0, 0 },
             { 0, 0, 0, 0 },
         }},
         {{ // L
-            { 0, 1, 0, 0 },
-            { 0, 1, 0, 0 },
-            { 0, 1, 1, 0 },
+            { 0, 2, 2, 0 },
+            { 0, 0, 2, 0 },
+            { 0, 0, 2, 0 },
             { 0, 0, 0, 0 },
         }},
         {{ // O
             { 0, 0, 0, 0 },
-            { 0, 1, 1, 0 },
-            { 0, 1, 1, 0 },
+            { 0, 3, 3, 0 },
+            { 0, 3, 3, 0 },
             { 0, 0, 0, 0 },
         }},
         {{ // Z
             { 0, 0, 0, 0 },
-            { 0, 1, 1, 0 },
-            { 1, 1, 0, 0 },
+            { 0, 4, 4, 0 },
+            { 0, 0, 4, 4 },
             { 0, 0, 0, 0 },
         }},
         {{ // T
-            { 0, 1, 0, 0 },
-            { 1, 1, 1, 0 },
             { 0, 0, 0, 0 },
+            { 0, 7, 7, 7 },
+            { 0, 0, 7, 0 },
             { 0, 0, 0, 0 },
         }},
         {{ // S
             { 0, 0, 0, 0 },
-            { 1, 1, 0, 0 },
+            { 0, 0, 1, 1 },
             { 0, 1, 1, 0 },
             { 0, 0, 0, 0 },
         }}
@@ -378,7 +478,9 @@ int main() {
     srand(SDL_GetTicksNS());
     map.showPiece(defaultShapes[rand() % defaultShapes.size()]);
 
-    const float tickRate = 1.0f / 2.0f; // 2 ticks per second
+    const float slowTickRate = 1.0f / 2.0f;
+    const float fastTickRate = 1.0f / 8.0f;
+    float tickRate = slowTickRate;
     float tickTimer = 0.0f;
 
     Uint64 lastTime = SDL_GetTicksNS();
@@ -415,6 +517,37 @@ int main() {
                         case SDLK_SPACE:
                         case SDLK_R: {
                             map.rotatePiece();
+                            break;
+                        }
+                        case SDLK_TAB: {
+                            map.showPiece(defaultShapes[rand() % defaultShapes.size()]);
+                            tickTimer = 0.0f;
+                            break;
+                        }
+                        case SDLK_S:
+                        case SDLK_DOWN:
+                        case SDLK_LSHIFT:
+                        case SDLK_RSHIFT: {
+                            if (!event.key.repeat) {
+                                tickTimer = 0.0f;
+                                tickRate = fastTickRate;
+                                map.tick();
+                            }
+                            break;
+                        }
+                        default: {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                case SDL_EVENT_KEY_UP: {
+                    switch (event.key.key) {
+                        case SDLK_S:
+                        case SDLK_DOWN:
+                        case SDLK_LSHIFT:
+                        case SDLK_RSHIFT: {
+                            tickRate = slowTickRate;
                             break;
                         }
                         default: {
