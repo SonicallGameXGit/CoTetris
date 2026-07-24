@@ -1,3 +1,5 @@
+#include <array>
+#include <optional>
 #include <vector>
 #include <SDL3_image/SDL_image.h>
 #include <glm/mat4x4.hpp>
@@ -514,7 +516,6 @@ int main() {
                         }
                         case SDLK_UP:
                         case SDLK_W:
-                        case SDLK_SPACE:
                         case SDLK_R: {
                             map.rotatePiece();
                             break;
@@ -526,6 +527,7 @@ int main() {
                         }
                         case SDLK_S:
                         case SDLK_DOWN:
+                        case SDLK_SPACE:
                         case SDLK_LSHIFT:
                         case SDLK_RSHIFT: {
                             if (!event.key.repeat) {
@@ -545,6 +547,7 @@ int main() {
                     switch (event.key.key) {
                         case SDLK_S:
                         case SDLK_DOWN:
+                        case SDLK_SPACE:
                         case SDLK_LSHIFT:
                         case SDLK_RSHIFT: {
                             tickRate = slowTickRate;
