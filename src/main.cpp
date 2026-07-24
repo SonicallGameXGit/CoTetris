@@ -4,6 +4,7 @@
 #include "game/map.hpp"
 
 int main() {
+    srand(static_cast<unsigned int>(time(nullptr)));
     const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
     if (!context.isValid()) {
         printf("Failed to initialize SDL: %s\n", SDL_GetError());
@@ -35,19 +36,23 @@ int main() {
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+
+    uint8_t mouseButtonsBitmask = 0;
+    glm::vec2 mousePosition = glm::vec2();
 
     Map map = Map();
-    srand(SDL_GetTicksNS());
-    map.showPiece(Piece::defaultShapes[rand() % Piece::defaultShapes.size()]);
+    std::array<std::array<uint8_t, Piece::width>, Piece::height> prefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
 
     const float slowTickRate = 1.0f / 2.0f;
-    const float fastTickRate = 1.0f / 8.0f;
+    const float fastTickRate = 1.0f / 12.0f;
     float tickRate = slowTickRate;
     float tickTimer = 0.0f;
 
     Uint64 lastTime = SDL_GetTicksNS();
     bool running = true;
     while (running) {
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -81,8 +86,21 @@ int main() {
                             break;
                         }
                         case SDLK_TAB: {
+                            for (const std::array<uint8_t, Piece::width> &row : prefab) {
+                                for (const uint8_t cell : row) {
+                                    if (cell != 0) {
+                                        goto filled;
+                                    }
+                                }
+                            }
                             map.showPiece(Piece::defaultShapes[rand() % Piece::defaultShapes.size()]);
+                            goto finished;
+
+                            filled:
+                            map.showPiece(prefab);
+                            finished:
                             tickTimer = 0.0f;
+                            std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
                             break;
                         }
                         case SDLK_S:
@@ -119,6 +137,26 @@ int main() {
                     }
                     break;
                 }
+                case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+                    mouseButtonsBitmask |= SDL_BUTTON_MASK(event.button.button);
+                    const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
+                    mousePosition.x = static_cast<float>(event.button.x) * pixelDensity;
+                    mousePosition.y = static_cast<float>(event.button.y) * pixelDensity;
+                    break;
+                }
+                case SDL_EVENT_MOUSE_BUTTON_UP: {
+                    mouseButtonsBitmask &= ~SDL_BUTTON_MASK(event.button.button);
+                    const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
+                    mousePosition.x = static_cast<float>(event.button.x) * pixelDensity;
+                    mousePosition.y = static_cast<float>(event.button.y) * pixelDensity;
+                    break;
+                }
+                case SDL_EVENT_MOUSE_MOTION: {
+                    const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
+                    mousePosition.x = static_cast<float>(event.motion.x) * pixelDensity;
+                    mousePosition.y = static_cast<float>(event.motion.y) * pixelDensity;
+                    break;
+                }
                 default: {
                     break;
                 }
@@ -136,10 +174,50 @@ int main() {
         }
 
         const float aspectRatio = windowWidth / windowHeight;
+        if ((mouseButtonsBitmask & SDL_BUTTON_LMASK) > 0 || (mouseButtonsBitmask & SDL_BUTTON_RMASK) > 0) {
+            const uint8_t brush = (mouseButtonsBitmask & SDL_BUTTON_LMASK) ? 1 : 0;
+
+            const float cellSize = 1.0f / static_cast<float>(Piece::height);
+            const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
+            const float yOffset = -0.05f;
+
+            const float relativeX = (mousePosition.x / windowWidth * 2.0f - 1.0f) * (windowWidth / windowHeight) - xOffset;
+            const float relativeY = (1.0f - mousePosition.y / windowHeight) * 2.0f - 1.0f - yOffset;
+
+            const int32_t cellX = static_cast<int32_t>(relativeX / cellSize);
+            const int32_t cellY = static_cast<int32_t>(relativeY / cellSize);
+
+            if (cellX >= 0 && cellX < static_cast<int32_t>(Piece::width) && cellY >= 0 && cellY < static_cast<int32_t>(Piece::height)) {
+                prefab[cellY][cellX] = brush;
+            }
+        }
+
         const glm::mat4 projectionViewMatrix = glm::ortho(-aspectRatio, aspectRatio, -1.0f, 1.0f);
 
         glClear(GL_COLOR_BUFFER_BIT);
         map.draw(projectionViewMatrix, aspectRatio);
+
+        BasicShader::getInstance().bind();
+        glBindVertexArray(MeshRegistry::getInstance().getQuad());
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, TextureRegistry::getInstance().getAtlasTexture());
+        const float cellSize = 1.0f / static_cast<float>(Piece::height);
+        const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
+        const float yOffset = -0.05f;
+        const float uvSize = 1.0f / 3.0f;
+        for (uint32_t x = 0; x < Piece::width; x++) {
+            for (uint32_t y = 0; y < Piece::height; y++) {
+                const float posX = static_cast<float>(x) * cellSize + xOffset;
+                const float posY = static_cast<float>(y) * cellSize + yOffset;
+                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(posX, posY, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
+                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+                const uint8_t value = prefab[y][x];
+                const float uvX = std::fmodf(static_cast<float>(value), 3.0f) * uvSize;
+                const float uvY = std::floorf(static_cast<float>(value) / 3.0f) * uvSize;
+                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            }
+        }
 
         SDL_GL_SwapWindow(window.get());
     }
