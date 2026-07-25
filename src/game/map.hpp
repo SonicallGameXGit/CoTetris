@@ -15,6 +15,7 @@ public:
     static constexpr size_t height = 20;
 private:
     std::array<std::array<uint8_t, Map::width>, Map::height> grid;
+    std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
     std::optional<Piece> piece;
     bool pieceLanded = false;
     bool justSpawnedPiece = false;
@@ -72,7 +73,9 @@ private:
         }
     }
 public:
-    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {}
+    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {
+        this->showPiece();
+    }
     ~Map() = default;
 
     void draw(const glm::mat4 &projectionViewMatrix, float aspectRatio) const {
@@ -117,12 +120,23 @@ public:
         }
     }
 
-    void showPiece(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
+    bool pushPrefab(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
+        // ! Let's for now keep one prefab at a time, maybe I'll do something fun with it later.
+        if (this->prefabStack.size() >= 1) { return false; }
+        this->prefabStack.push_back(prefab);
+        return true;
+    }
+    void popPrefab() {
+        if (this->prefabStack.empty()) { return; }
+        this->prefabStack.pop_back();
+    }
+    void showPiece() {
         if (this->piece.has_value()) { return; }
         this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
-        this->piece->copy(prefab);
+        this->piece->copy(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
         // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
         this->justSpawnedPiece = true;
+        this->popPrefab();
     }
     void hidePiece() {
         this->piece = std::nullopt;
@@ -151,6 +165,7 @@ public:
                     // ! Dead, for now, just reset the map.
                     this->grid.fill({});
                     this->hidePiece();
+                    this->showPiece();
                     return;
                 }
                 this->piece->y++;
@@ -170,6 +185,7 @@ public:
                 }
             }
             this->hidePiece();
+            this->showPiece();
         }
 
         bool done = false;

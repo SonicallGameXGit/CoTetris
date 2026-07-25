@@ -2,9 +2,16 @@
 #include "core/gl.hpp"
 #include "game/piece.hpp"
 #include "game/map.hpp"
+#include "game/button.hpp"
+
+float pixelToWorldX(const float x, const float windowWidth, const float windowHeight) {
+    return (x / windowWidth * 2.0f - 1.0f) * (windowWidth / windowHeight);
+}
+float pixelToWorldY(const float y, const float windowHeight) {
+    return (1.0f - y / windowHeight) * 2.0f - 1.0f;
+}
 
 int main() {
-    srand(static_cast<unsigned int>(time(nullptr)));
     const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
     if (!context.isValid()) {
         printf("Failed to initialize SDL: %s\n", SDL_GetError());
@@ -41,8 +48,53 @@ int main() {
     uint8_t mouseButtonsBitmask = 0;
     glm::vec2 mousePosition = glm::vec2();
 
+    srand(static_cast<unsigned int>(SDL_GetTicksNS()));
     Map map = Map();
     std::array<std::array<uint8_t, Piece::width>, Piece::height> prefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
+    uint8_t brush = 1;
+
+    std::vector<Toggle> toggles = std::vector<Toggle>();
+    toggles.reserve(6);
+    std::function<void(Toggle &self)> toggleCallback = [&](Toggle &self) {
+        self.state = true;
+        self.texture = TextureRegistry::getInstance().getAtlasHighlightedTexture();
+        for (size_t i = 0; i < toggles.size(); i++) {
+            if (&toggles[i] != &self) {
+                toggles[i].state = false;
+                toggles[i].texture = TextureRegistry::getInstance().getAtlasTexture();
+            } else {
+                brush = static_cast<uint8_t>(i + 1);
+            }
+        }
+    };
+    const float uvSize = 1.0f / 3.0f;
+    for (uint8_t i = 1; i < 7; i++) {
+        Toggle &toggle = toggles.emplace_back(TextureRegistry::getInstance().getAtlasTexture(), toggleCallback);
+        const float uvX = std::fmodf(static_cast<float>(i), 3.0f) * uvSize;
+        const float uvY = std::floorf(static_cast<float>(i) / 3.0f) * uvSize;
+        toggle.uv = glm::vec4(uvX, uvY, uvSize, uvSize);
+        toggle.size = glm::vec2(0.1f);
+    }
+    std::function<void()> pushPrefabButtonCallback = [&]() {
+        for (const std::array<uint8_t, Piece::width> &row : prefab) {
+            for (const uint8_t cell : row) {
+                if (cell != 0) {
+                    goto success;
+                }
+            }
+        }
+        return;
+
+        success:
+        if (map.pushPrefab(prefab)) {
+            printf("Pushed prefab to map.\n");
+            std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
+        }
+    };
+    Button pushPrefabButton = Button(TextureRegistry::getInstance().getPushButtonTexture(), [&](Button &self) {
+        pushPrefabButtonCallback();
+    });
+    pushPrefabButton.size = glm::vec2(0.1f);
 
     const float slowTickRate = 1.0f / 2.0f;
     const float fastTickRate = 1.0f / 12.0f;
@@ -52,7 +104,6 @@ int main() {
     Uint64 lastTime = SDL_GetTicksNS();
     bool running = true;
     while (running) {
-
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -85,24 +136,6 @@ int main() {
                             map.rotatePiece();
                             break;
                         }
-                        case SDLK_TAB: {
-                            for (const std::array<uint8_t, Piece::width> &row : prefab) {
-                                for (const uint8_t cell : row) {
-                                    if (cell != 0) {
-                                        goto filled;
-                                    }
-                                }
-                            }
-                            map.showPiece(Piece::defaultShapes[rand() % Piece::defaultShapes.size()]);
-                            goto finished;
-
-                            filled:
-                            map.showPiece(prefab);
-                            finished:
-                            tickTimer = 0.0f;
-                            std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
-                            break;
-                        }
                         case SDLK_S:
                         case SDLK_DOWN:
                         case SDLK_SPACE:
@@ -113,6 +146,10 @@ int main() {
                                 tickRate = fastTickRate;
                                 map.tick();
                             }
+                            break;
+                        }
+                        case SDLK_RETURN: {
+                            pushPrefabButtonCallback();
                             break;
                         }
                         default: {
@@ -140,21 +177,21 @@ int main() {
                 case SDL_EVENT_MOUSE_BUTTON_DOWN: {
                     mouseButtonsBitmask |= SDL_BUTTON_MASK(event.button.button);
                     const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
-                    mousePosition.x = static_cast<float>(event.button.x) * pixelDensity;
-                    mousePosition.y = static_cast<float>(event.button.y) * pixelDensity;
+                    mousePosition.x = pixelToWorldX(static_cast<float>(event.button.x) * pixelDensity, windowWidth, windowHeight);
+                    mousePosition.y = pixelToWorldY(static_cast<float>(event.button.y) * pixelDensity, windowHeight);
                     break;
                 }
                 case SDL_EVENT_MOUSE_BUTTON_UP: {
                     mouseButtonsBitmask &= ~SDL_BUTTON_MASK(event.button.button);
                     const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
-                    mousePosition.x = static_cast<float>(event.button.x) * pixelDensity;
-                    mousePosition.y = static_cast<float>(event.button.y) * pixelDensity;
+                    mousePosition.x = pixelToWorldX(static_cast<float>(event.button.x) * pixelDensity, windowWidth, windowHeight);
+                    mousePosition.y = pixelToWorldY(static_cast<float>(event.button.y) * pixelDensity, windowHeight);
                     break;
                 }
                 case SDL_EVENT_MOUSE_MOTION: {
                     const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
-                    mousePosition.x = static_cast<float>(event.motion.x) * pixelDensity;
-                    mousePosition.y = static_cast<float>(event.motion.y) * pixelDensity;
+                    mousePosition.x = pixelToWorldX(static_cast<float>(event.motion.x) * pixelDensity, windowWidth, windowHeight);
+                    mousePosition.y = pixelToWorldY(static_cast<float>(event.motion.y) * pixelDensity, windowHeight);
                     break;
                 }
                 default: {
@@ -174,21 +211,42 @@ int main() {
         }
 
         const float aspectRatio = windowWidth / windowHeight;
+        for (size_t i = 0; i < toggles.size(); i++) {
+            Toggle &toggle = toggles[i];
+            // FIXME: For now here and in many places in the code, we assume that there's a canvas for prefab drawing at these coordinates and of a specific size, but in future it should be moved into a separate class and share info like it's position and size with the rest of the code.
+            const float cellSize = 1.0f / static_cast<float>(Piece::height);
+            const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
+            const float yOffset = -0.05f;
+            toggle.position = glm::vec2(
+                xOffset + static_cast<float>(i) * (cellSize * static_cast<float>(Piece::width) / static_cast<float>(toggles.size())),
+                yOffset - toggle.size.y - 0.05f
+            );
+            toggle.update(mousePosition.x, mousePosition.y, (mouseButtonsBitmask & SDL_BUTTON_LMASK) > 0);
+        }
+        {
+            const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
+            const float yOffset = -0.05f;
+            pushPrefabButton.position = glm::vec2(
+                xOffset,
+                yOffset - toggles[0].size.y - pushPrefabButton.size.y - 0.1f
+            );
+            pushPrefabButton.update(mousePosition.x, mousePosition.y, (mouseButtonsBitmask & SDL_BUTTON_LMASK) > 0);
+        }
         if ((mouseButtonsBitmask & SDL_BUTTON_LMASK) > 0 || (mouseButtonsBitmask & SDL_BUTTON_RMASK) > 0) {
-            const uint8_t brush = (mouseButtonsBitmask & SDL_BUTTON_LMASK) ? 1 : 0;
+            const uint8_t maskedBrush = (mouseButtonsBitmask & SDL_BUTTON_LMASK) ? brush : 0;
 
             const float cellSize = 1.0f / static_cast<float>(Piece::height);
             const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
             const float yOffset = -0.05f;
 
-            const float relativeX = (mousePosition.x / windowWidth * 2.0f - 1.0f) * (windowWidth / windowHeight) - xOffset;
-            const float relativeY = (1.0f - mousePosition.y / windowHeight) * 2.0f - 1.0f - yOffset;
+            const float relativeX = mousePosition.x - xOffset;
+            const float relativeY = mousePosition.y - yOffset;
 
-            const int32_t cellX = static_cast<int32_t>(relativeX / cellSize);
-            const int32_t cellY = static_cast<int32_t>(relativeY / cellSize);
+            const int32_t cellX = static_cast<int32_t>(std::floorf(relativeX / cellSize));
+            const int32_t cellY = static_cast<int32_t>(std::floorf(relativeY / cellSize));
 
             if (cellX >= 0 && cellX < static_cast<int32_t>(Piece::width) && cellY >= 0 && cellY < static_cast<int32_t>(Piece::height)) {
-                prefab[cellY][cellX] = brush;
+                prefab[cellY][cellX] = maskedBrush;
             }
         }
 
@@ -204,7 +262,6 @@ int main() {
         const float cellSize = 1.0f / static_cast<float>(Piece::height);
         const float xOffset = 1.0f / static_cast<float>(Map::height) * static_cast<float>(Map::width) + 0.05f;
         const float yOffset = -0.05f;
-        const float uvSize = 1.0f / 3.0f;
         for (uint32_t x = 0; x < Piece::width; x++) {
             for (uint32_t y = 0; y < Piece::height; y++) {
                 const float posX = static_cast<float>(x) * cellSize + xOffset;
@@ -218,7 +275,10 @@ int main() {
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
         }
-
+        for (Toggle &toggle : toggles) {
+            toggle.draw(projectionViewMatrix);
+        }
+        pushPrefabButton.draw(projectionViewMatrix);
         SDL_GL_SwapWindow(window.get());
     }
 }

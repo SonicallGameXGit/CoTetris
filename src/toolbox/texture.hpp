@@ -6,7 +6,7 @@
 struct TextureRegistry {
 private:
     gl::Texture errorTexture;
-    std::optional<gl::Texture> atlasTexture;
+    std::optional<gl::Texture> atlasTexture, atlasHighlightedTexture, pushButtonTexture;
 
     static std::optional<gl::Texture> loadTexture(const char *path) {
         SDL_Surface *surface = IMG_Load(path);
@@ -34,7 +34,11 @@ private:
         return texture;
     }
 public:
-    TextureRegistry() : errorTexture(), atlasTexture(std::nullopt) {
+    TextureRegistry() :
+        errorTexture(),
+        atlasTexture(std::nullopt), atlasHighlightedTexture(std::nullopt),
+        pushButtonTexture(std::nullopt)
+    {
         glBindTexture(GL_TEXTURE_2D, this->errorTexture.get());
         {
             const uint8_t errorPixels[] = {
@@ -49,9 +53,11 @@ public:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
         this->atlasTexture = TextureRegistry::loadTexture("assets/atlas.png");
-        if (!this->atlasTexture.has_value()) {
-            fprintf(stderr, "Failed to load texture atlas.\n");
-        }
+        if (!this->atlasTexture.has_value()) { fprintf(stderr, "Failed to load texture atlas.\n"); }
+        this->atlasHighlightedTexture = TextureRegistry::loadTexture("assets/atlas_highlighted.png");
+        if (!this->atlasHighlightedTexture.has_value()) { fprintf(stderr, "Failed to load highlighted texture atlas.\n"); }
+        this->pushButtonTexture = TextureRegistry::loadTexture("assets/push_button.png");
+        if (!this->pushButtonTexture.has_value()) { fprintf(stderr, "Failed to load push button texture.\n"); }
     }
     ~TextureRegistry() = default;
 
@@ -62,5 +68,11 @@ public:
 
     GLuint getAtlasTexture() const {
         return this->atlasTexture.has_value() ? this->atlasTexture->get() : this->errorTexture.get();
+    }
+    GLuint getAtlasHighlightedTexture() const {
+        return this->atlasHighlightedTexture.has_value() ? this->atlasHighlightedTexture->get() : this->errorTexture.get();
+    }
+    GLuint getPushButtonTexture() const {
+        return this->pushButtonTexture.has_value() ? this->pushButtonTexture->get() : this->errorTexture.get();
     }
 };
