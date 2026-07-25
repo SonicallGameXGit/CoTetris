@@ -11,17 +11,77 @@ float pixelToWorldY(const float y, const float windowHeight) {
     return (1.0f - y / windowHeight) * 2.0f - 1.0f;
 }
 
-int main() {
-    const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
-    if (!context.isValid()) {
-        printf("Failed to initialize SDL: %s\n", SDL_GetError());
-        return -1;
+int32_t byteBufferToInt32(const std::vector<uint8_t>::iterator &buffer) {
+    int32_t value = 0;
+    for (size_t i = 0; i < 4; i++) {
+        value |= static_cast<int32_t>(*(buffer + i)) << (i * 8);
     }
+    return value;
+}
+std::vector<uint8_t>::iterator int32ToByteBuffer(const int32_t value, std::vector<uint8_t>::iterator &buffer) {
+    for (size_t i = 0; i < 4; i++) {
+        *(buffer + i) = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+    }
+    return buffer + 4;
+}
+uint16_t byteBufferToUInt16(const std::vector<uint8_t>::iterator &buffer) {
+    uint16_t value = 0;
+    for (size_t i = 0; i < 2; i++) {
+        value |= static_cast<uint16_t>(*(buffer + i)) << (i * 8);
+    }
+    return value;
+}
+std::vector<uint8_t>::iterator uint16ToByteBuffer(const uint16_t value, std::vector<uint8_t>::iterator &buffer) {
+    for (size_t i = 0; i < 2; i++) {
+        *(buffer + i) = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+    }
+    return buffer + 2;
+}
+std::string byteBufferToString(const std::vector<uint8_t>::iterator &buffer, const size_t length) {
+    return std::string(buffer, buffer + length);
+}
+std::vector<uint8_t>::iterator stringToByteBuffer(const std::string &str, std::vector<uint8_t>::iterator &buffer) {
+    for (size_t i = 0; i < str.size(); i++) {
+        *(buffer + i) = static_cast<uint8_t>(str[i]);
+    }
+    return buffer + str.size();
+}
+
+struct ClientState {
+private:
+    NET_StreamSocket *socket;
+    std::vector<uint8_t> buffer;
+    size_t bufferPosition = 0;
+public:
+    ClientState(NET_StreamSocket *socket) : socket(socket), buffer() {}
+    ~ClientState() {
+        NET_DestroyStreamSocket(this->socket);
+    }
+
+    void append(const uint8_t *data, size_t length) {
+        this->buffer.insert(this->buffer.end(), data, data + length);
+    }
+    std::optional<std::vector<uint8_t>::iterator> read(size_t length) {
+        if (bufferPosition + length > this->buffer.size()) { return std::nullopt; }
+        std::vector<uint8_t>::iterator it = this->buffer.begin() + bufferPosition;
+        bufferPosition += length;
+        return it;
+    }
+    void flush() {
+        this->buffer.erase(this->buffer.begin(), this->buffer.begin() + this->bufferPosition);
+        this->bufferPosition = 0;
+    }
+    size_t getBufferSize() const { return this->buffer.size(); }
+
+    NET_StreamSocket *getSocket() const { return this->socket; }
+};
+
+int client() {
     float windowWidth = 1280, windowHeight = 720;
     const sdl::Window window = sdl::Window("CoTetris", static_cast<int>(windowWidth), static_cast<int>(windowHeight), SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window.isValid()) {
-        printf("Failed to create window: %s\n", SDL_GetError());
-        return -1;
+        fprintf(stderr, "Failed to create window: %s\n", SDL_GetError());
+        return 1;
     }
     {
         const float pixelDensity = SDL_GetWindowPixelDensity(window.get());
@@ -33,12 +93,12 @@ int main() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     const sdl::GLContext glContext = sdl::GLContext(window.get());
     if (!glContext.isValid()) {
-        printf("Failed to create OpenGL context: %s\n", SDL_GetError());
-        return -1;
+        fprintf(stderr, "Failed to create OpenGL context: %s\n", SDL_GetError());
+        return 1;
     }
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
-        printf("Failed to initialize GLAD\n");
-        return -1;
+        fprintf(stderr, "Failed to initialize GLAD\n");
+        return 1;
     }
 
     glEnable(GL_BLEND);
@@ -281,4 +341,192 @@ int main() {
         pushPrefabButton.draw(projectionViewMatrix);
         SDL_GL_SwapWindow(window.get());
     }
+    return 0;
+}
+int server() {
+    constexpr Uint16 port = 25565;
+    sdl::NetServer server = sdl::NetServer(nullptr, port, 0);
+    if (!server.isValid()) {
+        fprintf(stderr, "Failed to create server: %s\n", SDL_GetError());
+        return 1;
+    }
+    printf("Server started on port %d.\n", port);
+
+    std::function<bool(ClientState &client)> packetCallback = [](ClientState &client) -> bool {
+        std::optional<std::vector<uint8_t>::iterator> packetId = client.read(1);
+        if (!packetId.has_value()) { return false; }
+        switch (*packetId.value()) {
+            case 0: {
+                std::optional<std::vector<uint8_t>::iterator> dataLength = client.read(10);
+                if (!dataLength.has_value()) { return false; }
+                int32_t x = byteBufferToInt32(dataLength.value());
+                int32_t y = byteBufferToInt32(dataLength.value() + 4);
+                uint16_t messageLength = byteBufferToUInt16(dataLength.value() + 8);
+                std::optional<std::vector<uint8_t>::iterator> messageData = client.read(messageLength);
+                if (!messageData.has_value()) { return false; }
+                std::string message = byteBufferToString(messageData.value(), messageLength);
+                printf("Received message from client: %s at (%d, %d)\n", message.c_str(), x, y);
+                break;
+            }
+            default: {
+                printf("Received unknown packet with ID %d from client.\n", *packetId.value());
+                break;
+            }
+        }
+
+        client.flush();
+        return true;
+    };
+
+    std::vector<std::unique_ptr<ClientState>> clients = std::vector<std::unique_ptr<ClientState>>();
+    bool running = true;
+    while (running) {
+        NET_StreamSocket *socket = nullptr;
+        while (NET_AcceptClient(server.get(), &socket) && socket != nullptr) {
+            clients.emplace_back(std::make_unique<ClientState>(socket));
+            printf("New client connected!\n");
+            socket = nullptr;
+        }
+
+        for (std::vector<std::unique_ptr<ClientState>>::iterator it = clients.begin(); it != clients.end(); ) {
+            ClientState &client = *it->get();
+
+            uint8_t buffer[4096];
+            int bytesRead = NET_ReadFromStreamSocket(client.getSocket(), buffer, sizeof(buffer));
+            
+            if (bytesRead < 0) {
+                printf("Client disconnected.\n");
+                it = clients.erase(it);
+                continue;
+            } else if (bytesRead > 0) {
+                client.append(buffer, static_cast<size_t>(bytesRead));
+                while (packetCallback(client));
+            }
+            ++it;
+        }
+
+        SDL_Delay(static_cast<Uint32>(1000.0f / 20.0f));
+    }
+
+    return 0;
+}
+int testClient() {
+    constexpr char address[] = "127.0.0.1";
+    constexpr Uint16 port = 25565;
+
+    printf("Resolving host %s...\n", address);
+    sdl::NetAddress netAddress = sdl::NetAddress(NET_ResolveHostname(address));
+    if (!netAddress.isValid()) {
+        fprintf(stderr, "Failed to resolve host: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (NET_WaitUntilResolved(netAddress.get(), -1) == NET_FAILURE) {
+        fprintf(stderr, "Failed to resolve host: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    printf("Connecting to server on port %d...\n", port);
+    sdl::NetStreamSocket clientSocket = sdl::NetStreamSocket(netAddress.get(), port, 0);
+    if (!clientSocket.isValid()) {
+        fprintf(stderr, "Failed to connect to server: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (NET_WaitUntilConnected(clientSocket.get(), -1) == NET_FAILURE) {
+        fprintf(stderr, "Failed to connect to server: %s\n", SDL_GetError());
+        return 1;
+    }
+    printf("Connected successfully!\n");
+
+    bool running = true;
+    Uint64 lastTime = SDL_GetTicksNS();
+    float tickTimer = 0.0f;
+    uint32_t messageCounter = 0;
+    while (running) {
+        Uint64 currentTime = SDL_GetTicksNS();
+        const float deltaTime = static_cast<float>(currentTime - lastTime) / 1e9f;
+        lastTime = currentTime;
+        
+        tickTimer += deltaTime;
+        if (tickTimer >= 1.0f) {
+            tickTimer -= 1.0f;
+            std::string message = "Hello from client! Message #" + std::to_string(messageCounter);
+            messageCounter++;
+            int32_t x = rand() % 100000 - 50000;
+            int32_t y = rand() % 100000 - 50000;
+            uint16_t messageLength = static_cast<uint16_t>(message.size());
+            std::vector<uint8_t> packet;
+            packet.push_back(0); // Packet ID
+            packet.resize(1 + 4 + 4 + 2 + messageLength);
+            std::vector<uint8_t>::iterator it = packet.begin() + 1;
+            it = int32ToByteBuffer(x, it);
+            it = int32ToByteBuffer(y, it);
+            it = uint16ToByteBuffer(messageLength, it);
+            it = stringToByteBuffer(message, it);
+
+            if (!NET_WriteToStreamSocket(clientSocket.get(), packet.data(), packet.size())) {
+                fprintf(stderr, "Failed to send message to server: %s\n", SDL_GetError());
+                return 1;
+            }
+            printf("Sent message to server: %s at (%d, %d)\n", message.c_str(), x, y);
+        }
+
+        char buffer[512];
+        int bytesRead = NET_ReadFromStreamSocket(clientSocket.get(), buffer, sizeof(buffer));
+        if (bytesRead < 0) {
+            fprintf(stderr, "Disconnected from server: %s\n", SDL_GetError());
+            return 1;
+        } else if (bytesRead > 0) {
+            printf("Received %d bytes from server.\n", bytesRead);
+        }
+
+        SDL_Delay(static_cast<Uint32>(1000.0f / 60.0f));
+    }
+
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s server/client\n", argv[0]);
+        return 1;
+    }
+    uint8_t netMode = 0;
+    if (strcmp(argv[1], "server") == 0) {
+        netMode = 1;
+    } else if (strcmp(argv[1], "client") == 0) {
+        netMode = 2;
+    } else {
+        fprintf(stderr, "Invalid argument: %s. Must be either 'server' or 'client'.\n", argv[1]);
+        return 1;
+    }
+    
+    if (netMode == 1) {
+        const sdl::Context context = sdl::Context(SDL_INIT_EVENTS);
+        if (!context.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL: %s\n", SDL_GetError());
+            return 1;
+        }
+        const sdl::NetContext netContext = sdl::NetContext();
+        if (!netContext.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL_net: %s\n", SDL_GetError());
+            return 1;
+        }
+
+        return server();
+    } else if (netMode == 2) {
+        const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+        if (!context.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL: %s\n", SDL_GetError());
+            return 1;
+        }
+        const sdl::NetContext netContext = sdl::NetContext();
+        if (!netContext.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL_net: %s\n", SDL_GetError());
+            return 1;
+        }
+
+        return testClient();
+    }
+
+    return 0;
 }

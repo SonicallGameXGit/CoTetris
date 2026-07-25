@@ -14,6 +14,7 @@ set(SDLIMAGE_STATIC ON CACHE BOOL "" FORCE)
 
 add_subdirectory(libs/SDL)
 add_subdirectory(libs/SDL_image)
+add_subdirectory(libs/SDL_net)
 add_subdirectory(libs/GLAD)
 add_subdirectory(libs/GLM)
 # add_subdirectory(libs/FreeType)
@@ -28,6 +29,7 @@ target_link_libraries(${PROJECT_NAME}
     PRIVATE
         SDL3::SDL3-static
         SDL3_image::SDL3_image-static
+        SDL3_net::SDL3_net-static
         GLAD
         glm::glm
         # freetype
@@ -37,6 +39,7 @@ target_include_directories(${PROJECT_NAME}
     PRIVATE
         libs/SDL/include
         libs/SDL_image/include
+        libs/SDL_net/include
         libs/GLAD/include
         libs/GLM
         # libs/FreeType/include
