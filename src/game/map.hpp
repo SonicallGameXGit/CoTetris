@@ -9,17 +9,42 @@
 #include "../toolbox/texture.hpp"
 #include "piece.hpp"
 
-struct Map {
+class Map {
 public:
     static constexpr size_t width = 10;
     static constexpr size_t height = 20;
-private:
-    std::array<std::array<uint8_t, Map::width>, Map::height> grid;
-    std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
-    std::optional<Piece> piece;
-    bool pieceLanded = false;
-    bool justSpawnedPiece = false;
 
+    std::array<std::array<uint8_t, Map::width>, Map::height> grid;
+    std::optional<Piece> piece;
+
+    Map() : grid(), piece(std::nullopt) {}
+    virtual ~Map() = default;
+
+    void showPiece(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
+        if (this->piece.has_value()) { return; }
+        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
+        this->piece->copy(prefab);
+        // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
+    }
+    void hidePiece() {
+        this->piece = std::nullopt;
+    }
+    void movePieceLeft() {
+        if (!this->piece.has_value()) { return; }
+        this->piece->x--;
+        this->resolvePieceCollisions();
+    }
+    void movePieceRight() {
+        if (!this->piece.has_value()) { return; }
+        this->piece->x++;
+        this->resolvePieceCollisions();
+    }
+    void rotatePiece() {
+        if (!this->piece.has_value()) { return; }
+        this->piece->rotateTo(this->piece->orientation + 1);
+        this->resolvePieceCollisions();
+    }
+protected:
     bool checkFuturePieceCollisions(const int16_t x, const int16_t y) {
         if (!this->piece.has_value()) { return false; }
         const glm::u8vec4 &bounds = this->piece->getBounds();
@@ -72,53 +97,16 @@ private:
             }
         }
     }
+};
+class ServerMap : private Map {
+    std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
+    bool pieceLanded = false;
+    bool justSpawnedPiece = false;
 public:
-    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {
+    ServerMap() : Map(), pieceLanded(false), justSpawnedPiece(false) {
         this->showPiece();
     }
-    ~Map() = default;
-
-    void draw(const glm::mat4 &projectionViewMatrix, float aspectRatio) const {
-        BasicShader::getInstance().bind();
-        glBindVertexArray(MeshRegistry::getInstance().getQuad());
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, TextureRegistry::getInstance().getAtlasTexture());
-
-        const float cellSize = 2.0f / static_cast<float>(Map::height);
-        const float gridX = (aspectRatio * 2.0f - static_cast<float>(Map::width) * cellSize) * 0.5f;
-        const float uvSize = 1.0f / 3.0f;
-        for (size_t row = 0; row < Map::height; row++) {
-            for (size_t col = 0; col < Map::width; col++) {
-                const float x = -aspectRatio + gridX + col * cellSize;
-                const float y = -1.0f + row * cellSize;
-                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
-                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
-
-                const float uvX = std::fmodf(static_cast<float>(this->grid[row][col]), 3.0f) * uvSize;
-                const float uvY = std::floorf(static_cast<float>(this->grid[row][col]) / 3.0f) * uvSize;
-                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
-
-                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-            }
-        }
-        if (!this->piece.has_value()) { return; }
-        for (size_t row = 0; row < Piece::height; row++) {
-            for (size_t col = 0; col < Piece::width; col++) {
-                if (this->piece->getCell(row, col) == 0) { continue; }
-
-                const float x = -aspectRatio + gridX + (col + this->piece->x) * cellSize;
-                const float y = -1.0f + (row + this->piece->y) * cellSize;
-                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
-                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
-
-                const float uvX = std::fmodf(static_cast<float>(this->piece->getCell(row, col)), 3.0f) * uvSize;
-                const float uvY = std::floorf(static_cast<float>(this->piece->getCell(row, col)) / 3.0f) * uvSize;
-                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
-
-                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-            }
-        }
-    }
+    ~ServerMap() = default;
 
     bool pushPrefab(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
         // ! Let's for now keep one prefab at a time, maybe I'll do something fun with it later.
@@ -132,30 +120,24 @@ public:
     }
     void showPiece() {
         if (this->piece.has_value()) { return; }
-        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
-        this->piece->copy(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
-        // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
-        this->justSpawnedPiece = true;
+        Map::showPiece(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
         this->popPrefab();
+        this->justSpawnedPiece = true;
     }
     void hidePiece() {
-        this->piece = std::nullopt;
+        Map::hidePiece();
+        this->justSpawnedPiece = false;
     }
     void movePieceLeft() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->x--;
-        this->resolvePieceCollisions();
+        Map::movePieceLeft();
     }
     void movePieceRight() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->x++;
-        this->resolvePieceCollisions();
+        Map::movePieceRight();
     }
     void rotatePiece() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->rotateTo(this->piece->orientation + 1);
-        this->resolvePieceCollisions();
+        Map::rotatePiece();
     }
+
     void tick() {
         if (this->piece.has_value()) {
             int16_t oldPieceY = this->piece->y;
@@ -205,6 +187,59 @@ public:
                 }
                 this->grid[Map::height - 1].fill(0);
                 done = false; // If we've found one filled row, there's a chance of finding another one, but if we didn't found any, there's no chance of finding one, of course.
+            }
+        }
+    }
+    const Piece *getPiece() const {
+        return this->piece.has_value() ? &this->piece.value() : nullptr;
+    }
+    const std::array<std::array<uint8_t, Map::width>, Map::height> &getGrid() const {
+        return this->grid;
+    }
+};
+class ClientMap : public Map {
+public:
+    ClientMap() = default;
+    ~ClientMap() = default;
+
+    void draw(const glm::mat4 &projectionViewMatrix, float aspectRatio) const {
+        BasicShader::getInstance().bind();
+        glBindVertexArray(MeshRegistry::getInstance().getQuad());
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, TextureRegistry::getInstance().getAtlasTexture());
+
+        const float cellSize = 2.0f / static_cast<float>(Map::height);
+        const float gridX = (aspectRatio * 2.0f - static_cast<float>(Map::width) * cellSize) * 0.5f;
+        const float uvSize = 1.0f / 3.0f;
+        for (size_t row = 0; row < Map::height; row++) {
+            for (size_t col = 0; col < Map::width; col++) {
+                const float x = -aspectRatio + gridX + col * cellSize;
+                const float y = -1.0f + row * cellSize;
+                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
+                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+
+                const float uvX = std::fmodf(static_cast<float>(this->grid[row][col]), 3.0f) * uvSize;
+                const float uvY = std::floorf(static_cast<float>(this->grid[row][col]) / 3.0f) * uvSize;
+                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            }
+        }
+        if (!this->piece.has_value()) { return; }
+        for (size_t row = 0; row < Piece::height; row++) {
+            for (size_t col = 0; col < Piece::width; col++) {
+                if (this->piece->getCell(row, col) == 0) { continue; }
+
+                const float x = -aspectRatio + gridX + (col + this->piece->x) * cellSize;
+                const float y = -1.0f + (row + this->piece->y) * cellSize;
+                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
+                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+
+                const float uvX = std::fmodf(static_cast<float>(this->piece->getCell(row, col)), 3.0f) * uvSize;
+                const float uvY = std::floorf(static_cast<float>(this->piece->getCell(row, col)) / 3.0f) * uvSize;
+                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
         }
     }

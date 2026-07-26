@@ -90,6 +90,9 @@ public:
     uint8_t getCell(uint8_t row, uint8_t col) const {
         return this->grid[row][col];
     }
+    uint8_t getPrefabCell(uint8_t row, uint8_t col) const {
+        return this->prefab[row][col];
+    }
     const glm::u8vec4 &getBounds() const {
         return this->bounds;
     }
