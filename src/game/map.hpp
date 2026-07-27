@@ -13,38 +13,14 @@ class Map {
 public:
     static constexpr size_t width = 10;
     static constexpr size_t height = 20;
-
+    
     std::array<std::array<uint8_t, Map::width>, Map::height> grid;
     std::optional<Piece> piece;
+private:
+    std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
+    bool pieceLanded = false;
+    bool justSpawnedPiece = false;
 
-    Map() : grid(), piece(std::nullopt) {}
-    virtual ~Map() = default;
-
-    void showPiece(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
-        if (this->piece.has_value()) { return; }
-        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
-        this->piece->copy(prefab);
-        // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
-    }
-    void hidePiece() {
-        this->piece = std::nullopt;
-    }
-    void movePieceLeft() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->x--;
-        this->resolvePieceCollisions();
-    }
-    void movePieceRight() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->x++;
-        this->resolvePieceCollisions();
-    }
-    void rotatePiece() {
-        if (!this->piece.has_value()) { return; }
-        this->piece->rotateTo(this->piece->orientation + 1);
-        this->resolvePieceCollisions();
-    }
-protected:
     bool checkFuturePieceCollisions(const int16_t x, const int16_t y) {
         if (!this->piece.has_value()) { return false; }
         const glm::u8vec4 &bounds = this->piece->getBounds();
@@ -97,16 +73,9 @@ protected:
             }
         }
     }
-};
-class ServerMap : private Map {
-    std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
-    bool pieceLanded = false;
-    bool justSpawnedPiece = false;
 public:
-    ServerMap() : Map(), pieceLanded(false), justSpawnedPiece(false) {
-        this->showPiece();
-    }
-    ~ServerMap() = default;
+    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {}
+    virtual ~Map() = default;
 
     bool pushPrefab(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
         // ! Let's for now keep one prefab at a time, maybe I'll do something fun with it later.
@@ -120,22 +89,29 @@ public:
     }
     void showPiece() {
         if (this->piece.has_value()) { return; }
-        Map::showPiece(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
+        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
+        this->piece->copy(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
+        // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
         this->popPrefab();
         this->justSpawnedPiece = true;
     }
     void hidePiece() {
-        Map::hidePiece();
-        this->justSpawnedPiece = false;
+        this->piece = std::nullopt;
     }
     void movePieceLeft() {
-        Map::movePieceLeft();
+        if (!this->piece.has_value()) { return; }
+        this->piece->x--;
+        this->resolvePieceCollisions();
     }
     void movePieceRight() {
-        Map::movePieceRight();
+        if (!this->piece.has_value()) { return; }
+        this->piece->x++;
+        this->resolvePieceCollisions();
     }
     void rotatePiece() {
-        Map::rotatePiece();
+        if (!this->piece.has_value()) { return; }
+        this->piece->rotateTo(this->piece->orientation + 1);
+        this->resolvePieceCollisions();
     }
 
     void tick() {
@@ -189,12 +165,6 @@ public:
                 done = false; // If we've found one filled row, there's a chance of finding another one, but if we didn't found any, there's no chance of finding one, of course.
             }
         }
-    }
-    const Piece *getPiece() const {
-        return this->piece.has_value() ? &this->piece.value() : nullptr;
-    }
-    const std::array<std::array<uint8_t, Map::width>, Map::height> &getGrid() const {
-        return this->grid;
     }
 };
 class ClientMap : public Map {

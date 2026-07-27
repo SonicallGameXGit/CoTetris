@@ -259,7 +259,7 @@ int client(const char *ip, Uint16 port) {
                         }
                         case SDLK_RETURN: {
                             if (event.key.repeat) { break; }
-                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Builder) { break; }
                             pushPrefabButtonCallback();
                             break;
                         }
@@ -445,7 +445,7 @@ int server(const char *ip, Uint16 port) {
     }
     printf("Server started on port %d.\n", port);
 
-    std::optional<ServerMap> map = std::nullopt;
+    std::optional<Map> map = std::nullopt;
     const float slowTickRate = 1.0f / 2.0f;
     const float fastTickRate = 1.0f / 12.0f;
     float tickRate = slowTickRate;
@@ -484,6 +484,7 @@ int server(const char *ip, Uint16 port) {
                     }
                     if (player != nullptr && builder != nullptr && !map.has_value()) {
                         map.emplace();
+                        map->showPiece();
                     }
                     PacketSender responseSender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
                     responsePacket.build(responseSender.getMutableBuffer());
@@ -502,11 +503,10 @@ int server(const char *ip, Uint16 port) {
                     map->movePieceLeft();
                 }
 
-                const Piece *piece = map->getPiece();
-                if (piece == nullptr) { break; }
+                if (!map->piece.has_value()) { break; }
 
                 PiecePositionPacket piecePositionPacket = PiecePositionPacket();
-                piecePositionPacket.x = piece->x;
+                piecePositionPacket.x = map->piece->x;
                 PacketSender sender = PacketSender(PacketId::S_PiecePosition, std::vector<uint8_t>());
                 piecePositionPacket.build(sender.getMutableBuffer());
                 for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
@@ -522,8 +522,8 @@ int server(const char *ip, Uint16 port) {
                 if (!map.has_value() || &client != player) { break; }
 
                 map->rotatePiece();
-                const Piece *piece = map->getPiece();
-                if (piece == nullptr) { break; }
+                if (!map->piece.has_value()) { break; }
+                const Piece *piece = &map->piece.value();
 
                 packet.orientation = piece->orientation;
                 PacketSender sender = PacketSender(PacketId::SC_PieceRotate, std::vector<uint8_t>());
@@ -589,7 +589,9 @@ int server(const char *ip, Uint16 port) {
                     builder = nullptr;
                 }
                 it = clients.erase(it);
-                if (player == nullptr && builder == nullptr) { map = ServerMap(); }
+                if (player == nullptr && builder == nullptr) {
+                    map = std::nullopt;
+                }
                 continue;
             } else if (bytesRead > 0) {
                 client.receive(buffer, static_cast<size_t>(bytesRead));
@@ -612,8 +614,8 @@ int server(const char *ip, Uint16 port) {
                 // 1. Instead of sending the entire grid and piece every tick, we should only send the changes (deltas) to reduce bandwidth usage.
                 // 2. Instead of requiring the client to just ask the server to move the piece and receive the new world state, we should allow the client to move the piece locally and only send the new world state when the piece is far enough from the real position, to reduce latency and make the game feel more responsive, while keeping it safe from cheating.
                 TickPacket tickPacket = TickPacket();
-                tickPacket.grid = map->getGrid();
-                tickPacket.piece = *map->getPiece();
+                tickPacket.grid = map->grid;
+                tickPacket.piece = map->piece;
     
                 PacketSender sender = PacketSender(PacketId::S_Tick, std::vector<uint8_t>());
                 tickPacket.build(sender.getMutableBuffer());
