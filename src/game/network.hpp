@@ -6,7 +6,7 @@
 
 namespace Network {
     // ! Protocol version number. Increment this when making changes to the protocol that are not backwards compatible.
-    static const uint32_t PROTOCOL_VERSION = 1;
+    static const uint32_t PROTOCOL_VERSION = 2;
 }
 
 // Prefixes:
@@ -17,7 +17,8 @@ enum class PacketId : uint8_t {
     SC_Handshake, S_ClientTypeSet,
     C_PieceMove, S_PiecePosition, SC_PieceRotate,
     C_PrefabPush, S_PrefabPushSucceed,
-    S_Tick, C_TickRateChange,
+    S_Tick, C_TickDelta, C_TickRateChange,
+    S_SpawnPiece,
     Invalid = 255,
 };
 
@@ -313,6 +314,28 @@ public:
         return true;
     }
 };
+struct TickDeltaPacket : public AbstractPacket {
+public:
+    int16_t x, y;
+    uint8_t orientation;
+    TickDeltaPacket() : AbstractPacket(), x(0), y(0), orientation(0) {}
+    virtual ~TickDeltaPacket() = default;
+
+    virtual void build(std::vector<uint8_t> &buffer) const override {
+        AbstractPacket::pushInt16(buffer, this->x);
+        AbstractPacket::pushInt16(buffer, this->y);
+        AbstractPacket::pushUInt8(buffer, this->orientation);
+    }
+    virtual bool parse(PacketReceiver &client) override {
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(5);
+        if (!reserveTry.has_value()) { return false; }
+        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
+        this->x = AbstractPacket::parseInt16(reserve);
+        this->y = AbstractPacket::parseInt16(reserve);
+        this->orientation = AbstractPacket::parseUInt8(reserve);
+        return true;
+    }
+};
 struct TickRateChangePacket : public AbstractPacket {
 public:
     bool fast;
@@ -327,6 +350,39 @@ public:
         if (!reserveTry.has_value()) { return false; }
         std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
         this->fast = AbstractPacket::parseUInt8(reserve) != 0;
+        return true;
+    }
+};
+struct SpawnPiecePacket : public AbstractPacket {
+public:
+    Piece piece;
+    SpawnPiecePacket() : AbstractPacket(), piece(0, 0, 0) {}
+    virtual ~SpawnPiecePacket() = default;
+    
+    virtual void build(std::vector<uint8_t> &buffer) const override {
+        AbstractPacket::pushInt16(buffer, this->piece.x);
+        AbstractPacket::pushInt16(buffer, this->piece.y);
+        AbstractPacket::pushUInt8(buffer, this->piece.orientation);
+        for (size_t row = 0; row < Piece::height; row++) {
+            for (size_t col = 0; col < Piece::width; col++) {
+                AbstractPacket::pushUInt8(buffer, this->piece.getPrefabCell(row, col));
+            }
+        }
+    }
+    virtual bool parse(PacketReceiver &client) override {
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(5 + Piece::width * Piece::height);
+        if (!reserveTry.has_value()) { return false; }
+        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
+        this->piece.x = AbstractPacket::parseInt16(reserve);
+        this->piece.y = AbstractPacket::parseInt16(reserve);
+        this->piece.orientation = AbstractPacket::parseUInt8(reserve);
+        std::array<std::array<uint8_t, Piece::width>, Piece::height> tempPrefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
+        for (size_t row = 0; row < Piece::height; row++) {
+            for (size_t col = 0; col < Piece::width; col++) {
+                tempPrefab[row][col] = AbstractPacket::parseUInt8(reserve);
+            }
+        }
+        this->piece.copy(tempPrefab);
         return true;
     }
 };

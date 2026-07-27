@@ -12,6 +12,11 @@ float pixelToWorldY(const float y, const float windowHeight) {
     return (1.0f - y / windowHeight) * 2.0f - 1.0f;
 }
 
+namespace GameProperties {
+    static constexpr float SLOW_TICK_RATE = 1.0f / 2.0f;
+    static constexpr float FAST_TICK_RATE = 1.0f / 12.0f;
+}
+
 int client(const char *ip, Uint16 port) {
     printf("Resolving host %s...\n", ip);
     sdl::NetAddress netAddress = sdl::NetAddress(NET_ResolveHostname(ip));
@@ -126,8 +131,8 @@ int client(const char *ip, Uint16 port) {
     });
     pushPrefabButton.size = glm::vec2(0.1f);
 
-    float tickRate = 1.0f / 60.0f;
-    float tickTimer = 0.0f;
+    float networkTickRate = 1.0f / 60.0f, networkTickTimer = 0.0f;
+    float tickRate = GameProperties::SLOW_TICK_RATE, tickTimer = 0.0f;
 
     std::optional<ClientType> clientType = std::nullopt;
     std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
@@ -173,6 +178,12 @@ int client(const char *ip, Uint16 port) {
                 TickPacket packet = TickPacket();
                 if (!packet.parse(client)) { return false; }
                 map.grid = packet.grid;
+                map.piece = packet.piece;
+                break;
+            }
+            case PacketId::S_SpawnPiece: {
+                SpawnPiecePacket packet = SpawnPiecePacket();
+                if (!packet.parse(client)) { return false; }
                 map.piece = packet.piece;
                 break;
             }
@@ -250,6 +261,7 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_RSHIFT: {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            tickRate = GameProperties::FAST_TICK_RATE;
                             TickRateChangePacket packet = TickRateChangePacket();
                             packet.fast = true;
                             PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
@@ -277,6 +289,7 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_LSHIFT:
                         case SDLK_RSHIFT: {
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            tickRate = GameProperties::SLOW_TICK_RATE;
                             TickRateChangePacket packet = TickRateChangePacket();
                             packet.fast = false;
                             PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
@@ -320,9 +333,9 @@ int client(const char *ip, Uint16 port) {
         const float deltaTime = static_cast<float>(currentTime - lastTime) / 1e9f;
         lastTime = currentTime;
 
-        tickTimer += deltaTime;
-        if (tickTimer >= tickRate) {
-            tickTimer -= tickRate;
+        networkTickTimer += deltaTime;
+        if (networkTickTimer >= networkTickRate) {
+            networkTickTimer -= networkTickRate;
 
             uint8_t buffer[4096];
             int bytesRead = NET_ReadFromStreamSocket(client.getSocket(), buffer, sizeof(buffer));
@@ -337,6 +350,24 @@ int client(const char *ip, Uint16 port) {
                 client.receive(buffer, static_cast<size_t>(bytesRead));
                 while (packetCallback(client));
                 client.rewind();
+            }
+        }
+
+        if (clientType.has_value() && clientType.value() == ClientType::Player) {
+            tickTimer += deltaTime;
+            if (tickTimer >= tickRate) {
+                tickTimer -= tickRate;
+                map.tick();
+                
+                if (map.piece.has_value()) {
+                    TickDeltaPacket packet = TickDeltaPacket();
+                    packet.x = map.piece->x;
+                    packet.y = map.piece->y;
+                    packet.orientation = map.piece->orientation;
+                    PacketSender sender = PacketSender(PacketId::C_TickDelta, std::vector<uint8_t>());
+                    packet.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
             }
         }
 
@@ -446,12 +477,11 @@ int server(const char *ip, Uint16 port) {
     printf("Server started on port %d.\n", port);
 
     std::optional<Map> map = std::nullopt;
-    const float slowTickRate = 1.0f / 2.0f;
-    const float fastTickRate = 1.0f / 12.0f;
-    float tickRate = slowTickRate;
+    float tickRate = GameProperties::SLOW_TICK_RATE;
 
     std::vector<std::unique_ptr<PacketReceiver>> clients = std::vector<std::unique_ptr<PacketReceiver>>();
     PacketReceiver *player = nullptr, *builder = nullptr;
+    uint8_t playerWarnings = 0;
 
     std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
         std::optional<PacketId> packetId = client.getPacketId();
@@ -464,9 +494,11 @@ int server(const char *ip, Uint16 port) {
 
                 const uint32_t clientProtocolVersion = packet.protocolVersion;
                 packet.protocolVersion = Network::PROTOCOL_VERSION;
-                PacketSender sender = PacketSender(PacketId::SC_Handshake, std::vector<uint8_t>());
-                packet.build(sender.getMutableBuffer());
-                sender.send(client.getSocket());
+                {
+                    PacketSender sender = PacketSender(PacketId::SC_Handshake, std::vector<uint8_t>());
+                    packet.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
 
                 if (clientProtocolVersion != Network::PROTOCOL_VERSION) {
                     printf("Client has incompatible protocol version %d, expected %d.\n", clientProtocolVersion, Network::PROTOCOL_VERSION);
@@ -485,10 +517,15 @@ int server(const char *ip, Uint16 port) {
                     if (player != nullptr && builder != nullptr && !map.has_value()) {
                         map.emplace();
                         map->showPiece();
+                        SpawnPiecePacket spawnPiecePacket = SpawnPiecePacket();
+                        spawnPiecePacket.piece = map->piece.value();
+                        PacketSender sender = PacketSender(PacketId::S_SpawnPiece, std::vector<uint8_t>());
+                        spawnPiecePacket.build(sender.getMutableBuffer());
+                        sender.send(player->getSocket());
                     }
-                    PacketSender responseSender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
-                    responsePacket.build(responseSender.getMutableBuffer());
-                    responseSender.send(client.getSocket());
+                    PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
                 }
                 break;
             }
@@ -548,11 +585,46 @@ int server(const char *ip, Uint16 port) {
                 }
                 break;
             }
+            case PacketId::C_TickDelta: {
+                TickDeltaPacket packet = TickDeltaPacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.has_value() || &client != player) { break; }
+
+                if (!map->piece.has_value()) { break; }
+                // FIXME: Probably not the best solution, but for now it's enough I think for cases with <100ms latency, I don't think someone will seriously click more than 10 times per second.
+                int distance = (3.0f / GameProperties::SLOW_TICK_RATE) * tickRate;
+                if (
+                    std::abs(map->piece->x - packet.x) > 2 ||
+                    std::abs(map->piece->y - packet.y) > 2 ||
+                    map->piece->orientation != packet.orientation
+                ) {
+                    playerWarnings++;
+                    if (playerWarnings >= 3) {
+                        TickPacket tickPacket = TickPacket();
+                        tickPacket.grid = map->grid;
+                        tickPacket.piece = map->piece;
+                        PacketSender sender = PacketSender(PacketId::S_Tick, std::vector<uint8_t>());
+                        tickPacket.build(sender.getMutableBuffer());
+                        sender.send(client.getSocket());
+                        playerWarnings = 0;
+                    }
+                    break;
+                } else {
+                    playerWarnings = 0;
+                }
+                map->piece->x = packet.x;
+                map->piece->y = packet.y;
+                // Ensures that the collision will be handled correctly.
+                while (map->piece->orientation != packet.orientation) {
+                    map->rotatePiece();
+                }
+                break;
+            }
             case PacketId::C_TickRateChange: {
                 TickRateChangePacket packet = TickRateChangePacket();
                 if (!packet.parse(client)) { return false; }
                 if (!map.has_value() || &client != player) { break; }
-                tickRate = packet.fast ? fastTickRate : slowTickRate;
+                tickRate = packet.fast ? GameProperties::FAST_TICK_RATE : GameProperties::SLOW_TICK_RATE;
                 break;
             }
             default: {
@@ -608,7 +680,17 @@ int server(const char *ip, Uint16 port) {
         if (tickTimer >= tickRate) {
             tickTimer -= tickRate;
             if (map.has_value()) {
-                map->tick();
+                if (!map->piece.has_value()) {
+                    map->showPiece();
+                    if (player != nullptr) {
+                        SpawnPiecePacket spawnPiecePacket = SpawnPiecePacket();
+                        spawnPiecePacket.piece = map->piece.value();
+                        PacketSender sender = PacketSender(PacketId::S_SpawnPiece, std::vector<uint8_t>());
+                        spawnPiecePacket.build(sender.getMutableBuffer());
+                        sender.send(player->getSocket());
+                    }
+                }
+                bool mapUpdated = map->tick();
     
                 // FIXME: The ideas: send only the changes, allow the client to move the piece locally and only fix it when it's far enough from the real position - look below for more details:
                 // 1. Instead of sending the entire grid and piece every tick, we should only send the changes (deltas) to reduce bandwidth usage.
@@ -621,6 +703,7 @@ int server(const char *ip, Uint16 port) {
                 tickPacket.build(sender.getMutableBuffer());
                 for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
                     PacketReceiver &client = *it->get();
+                    if (!mapUpdated && &client == player) { continue; }
                     sender.send(client.getSocket());
                 }
             }

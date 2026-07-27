@@ -114,7 +114,8 @@ public:
         this->resolvePieceCollisions();
     }
 
-    void tick() {
+    bool tick() {
+        bool gridUpdated = false;
         if (this->piece.has_value()) {
             int16_t oldPieceY = this->piece->y;
             this->piece->y--;
@@ -123,10 +124,13 @@ public:
                     // ! Dead, for now, just reset the map.
                     this->grid.fill({});
                     this->hidePiece();
-                    this->showPiece();
-                    return;
+                    gridUpdated = true;
+                    return gridUpdated;
                 }
                 this->piece->y++;
+                this->pieceLanded = true;
+            }
+            if (this->piece->y == oldPieceY) {
                 this->pieceLanded = true;
             }
         }
@@ -143,7 +147,7 @@ public:
                 }
             }
             this->hidePiece();
-            this->showPiece();
+            gridUpdated = true;
         }
 
         bool done = false;
@@ -162,9 +166,11 @@ public:
                     this->grid[r] = this->grid[r + 1];
                 }
                 this->grid[Map::height - 1].fill(0);
+                gridUpdated = true;
                 done = false; // If we've found one filled row, there's a chance of finding another one, but if we didn't found any, there's no chance of finding one, of course.
             }
         }
+        return gridUpdated;
     }
 };
 class ClientMap : public Map {

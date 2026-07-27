@@ -60,7 +60,7 @@ private:
 public:
     int16_t x, y;
     uint8_t orientation;
-    Piece(int16_t x, int16_t y, uint8_t orientation) : prefab(), grid(), x(x), y(y), orientation(orientation) {}
+    Piece(int16_t x, int16_t y, uint8_t orientation) : prefab(), grid(), bounds(), x(x), y(y), orientation(orientation) {}
     ~Piece() = default;
     
     void rotateTo(uint8_t orientation) {
