@@ -3,6 +3,7 @@
 #include "game/piece.hpp"
 #include "game/map.hpp"
 #include "game/button.hpp"
+#include "game/network.hpp"
 
 float pixelToWorldX(const float x, const float windowWidth, const float windowHeight) {
     return (x / windowWidth * 2.0f - 1.0f) * (windowWidth / windowHeight);
@@ -10,93 +11,6 @@ float pixelToWorldX(const float x, const float windowWidth, const float windowHe
 float pixelToWorldY(const float y, const float windowHeight) {
     return (1.0f - y / windowHeight) * 2.0f - 1.0f;
 }
-
-int32_t byteBufferToInt32(const std::vector<uint8_t>::iterator &buffer) {
-    int32_t value = 0;
-    for (size_t i = 0; i < 4; i++) {
-        value |= static_cast<int32_t>(*(buffer + i)) << (i * 8);
-    }
-    return value;
-}
-std::vector<uint8_t>::iterator int32ToByteBuffer(const int32_t value, std::vector<uint8_t>::iterator &buffer) {
-    for (size_t i = 0; i < 4; i++) {
-        *(buffer + i) = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
-    }
-    return buffer + 4;
-}
-uint16_t byteBufferToUInt16(const std::vector<uint8_t>::iterator &buffer) {
-    uint16_t value = 0;
-    for (size_t i = 0; i < 2; i++) {
-        value |= static_cast<uint16_t>(*(buffer + i)) << (i * 8);
-    }
-    return value;
-}
-std::vector<uint8_t>::iterator uint16ToByteBuffer(const uint16_t value, std::vector<uint8_t>::iterator &buffer) {
-    for (size_t i = 0; i < 2; i++) {
-        *(buffer + i) = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
-    }
-    return buffer + 2;
-}
-int16_t byteBufferToInt16(const std::vector<uint8_t>::iterator &buffer) {
-    int16_t value = 0;
-    for (size_t i = 0; i < 2; i++) {
-        value |= static_cast<int16_t>(*(buffer + i)) << (i * 8);
-    }
-    return value;
-}
-void int16ToByteBuffer(const int16_t value, std::vector<uint8_t>::iterator &buffer) {
-    for (size_t i = 0; i < 2; i++) {
-        *(buffer + i) = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
-    }
-}
-std::string byteBufferToString(const std::vector<uint8_t>::iterator &buffer, const size_t length) {
-    return std::string(buffer, buffer + length);
-}
-std::vector<uint8_t>::iterator stringToByteBuffer(const std::string &str, std::vector<uint8_t>::iterator &buffer) {
-    for (size_t i = 0; i < str.size(); i++) {
-        *(buffer + i) = static_cast<uint8_t>(str[i]);
-    }
-    return buffer + str.size();
-}
-
-struct ClientState {
-private:
-    NET_StreamSocket *socket;
-    std::vector<uint8_t> buffer;
-    size_t bufferPosition;
-    bool own;
-public:
-    ClientState(NET_StreamSocket *socket, bool own) : socket(socket), buffer(), bufferPosition(0), own(own) {}
-    ~ClientState() {
-        if (this->own) {
-            NET_DestroyStreamSocket(this->socket);
-        }
-    }
-
-    void append(const uint8_t *data, size_t length) {
-        this->buffer.insert(this->buffer.end(), data, data + length);
-    }
-    std::optional<std::vector<uint8_t>::iterator> read(size_t length) {
-        if (bufferPosition + length > this->buffer.size()) {
-            this->bufferPosition = 0;
-            return std::nullopt;
-        }
-        std::vector<uint8_t>::iterator it = this->buffer.begin() + bufferPosition;
-        bufferPosition += length;
-        return it;
-    }
-    void clear() {
-        this->buffer.clear();
-        this->bufferPosition = 0;
-    }
-    void flush() {
-        this->buffer.erase(this->buffer.begin(), this->buffer.begin() + this->bufferPosition);
-        this->bufferPosition = 0;
-    }
-    size_t getBufferSize() const { return this->buffer.size(); }
-
-    NET_StreamSocket *getSocket() const { return this->socket; }
-};
 
 int client(const char *ip, Uint16 port) {
     printf("Resolving host %s...\n", ip);
@@ -120,8 +34,17 @@ int client(const char *ip, Uint16 port) {
         fprintf(stderr, "Failed to connect to server: %s\n", SDL_GetError());
         return 1;
     }
-    ClientState clientState = ClientState(clientSocket.get(), false);
+    PacketReceiver client = PacketReceiver(clientSocket.get(), false);
     printf("Connected successfully!\n");
+
+    {
+        HandshakePacket handshakePacket = HandshakePacket();
+        handshakePacket.protocolVersion = Network::PROTOCOL_VERSION;
+        PacketSender sender = PacketSender(PacketId::SC_Handshake, std::vector<uint8_t>());
+        handshakePacket.build(sender.getMutableBuffer());
+        sender.send(client.getSocket());
+    }
+
 
     float windowWidth = 1280, windowHeight = 720;
     const sdl::Window window = sdl::Window("CoTetris", static_cast<int>(windowWidth), static_cast<int>(windowHeight), SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
@@ -192,15 +115,11 @@ int client(const char *ip, Uint16 port) {
         return;
 
         success:
-        std::vector<uint8_t> packet = std::vector<uint8_t>();
-        packet.reserve(1 + Piece::width * Piece::height);
-        packet.push_back(3);
-        for (const std::array<uint8_t, Piece::width> &row : prefab) {
-            for (const uint8_t cell : row) {
-                packet.push_back(cell);
-            }
-        }
-        NET_WriteToStreamSocket(clientState.getSocket(), packet.data(), packet.size());
+        PrefabPushPacket packet = PrefabPushPacket();
+        packet.prefab = prefab;
+        PacketSender sender = PacketSender(PacketId::C_PrefabPush, std::vector<uint8_t>());
+        packet.build(sender.getMutableBuffer());
+        sender.send(client.getSocket());
     };
     Button pushPrefabButton = Button(TextureRegistry::getInstance().getPushButtonTexture(), [&](Button &self) {
         pushPrefabButtonCallback();
@@ -210,74 +129,55 @@ int client(const char *ip, Uint16 port) {
     float tickRate = 1.0f / 60.0f;
     float tickTimer = 0.0f;
 
-    std::optional<uint8_t> playerType = std::nullopt;
-    std::function<bool(ClientState &client)> packetCallback = [&](ClientState &client) -> bool {
-        std::optional<std::vector<uint8_t>::iterator> packetId = client.read(1);
+    std::optional<ClientType> clientType = std::nullopt;
+    std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
+        const std::optional<PacketId> packetId = client.getPacketId();
         if (!packetId.has_value()) { return false; }
-        switch (*packetId.value()) {
-            case 1: { // Client asked to move piece horizontally.
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(2);
-                if (!reserve.has_value()) { return false; }
-                const int16_t x = byteBufferToInt16(reserve.value());
-                if (map.piece.has_value()) {
-                    map.piece->x = x;
+        switch (packetId.value()) {
+            case PacketId::SC_Handshake: {
+                HandshakePacket packet = HandshakePacket();
+                if (!packet.parse(client)) { return false; }
+                if (packet.protocolVersion != Network::PROTOCOL_VERSION) {
+                    fprintf(stderr, "Protocol version mismatch: server is using version %d, but client is using version %d\n", packet.protocolVersion, Network::PROTOCOL_VERSION);
                 }
                 break;
             }
-            case 2: { // Client asked to rotate piece.
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(1);
-                if (!reserve.has_value()) { return false; }
-                const uint8_t orientation = *reserve.value();
-                if (map.piece.has_value()) {
-                    map.piece->rotateTo(orientation);
-                }
+            case PacketId::S_ClientTypeSet: {
+                ClientTypeSetPacket packet = ClientTypeSetPacket();
+                if (!packet.parse(client)) { return false; }
+                clientType = packet.type;
+                printf("Client type set to %s.\n", clientType.value() == ClientType::Player ? "Player" : "Builder");
                 break;
             }
-            case 3: { // Client pushed prefab to the stack.
-                if (playerType.has_value() && playerType.value() == 1) {
-                    std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
-                }
+            case PacketId::S_PiecePosition: {
+                PiecePositionPacket packet = PiecePositionPacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.piece.has_value()) { map.piece.emplace(0, 0, 0); }
+                map.piece->x = packet.x;
                 break;
             }
-            case 4: { // Tick.
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(Map::width * Map::height + 1);
-                if (!reserve.has_value()) { return false; }
-                for (size_t row = 0; row < Map::height; row++) {
-                    for (size_t col = 0; col < Map::width; col++) {
-                        map.grid[row][col] = *reserve.value();
-                        reserve.value()++;
-                    }
-                }
-                bool pieceExists = static_cast<bool>(*reserve.value());
-                if (!pieceExists) { map.piece = std::nullopt; }
-                else {
-                    reserve = client.read(5 + Piece::width * Piece::height);
-                    if (!reserve.has_value()) { return false; }
-                    if (!map.piece.has_value()) { map.piece.emplace(0, 0, 0); }
-
-                    map.piece->x = byteBufferToInt16(reserve.value()); *reserve += 2;
-                    map.piece->y = byteBufferToInt16(reserve.value()); *reserve += 2;
-                    map.piece->orientation = *reserve.value(); (*reserve)++;
-                    std::array<std::array<uint8_t, Piece::width>, Piece::height> tempPrefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
-                    for (size_t row = 0; row < Piece::height; row++) {
-                        for (size_t col = 0; col < Piece::width; col++) {
-                            tempPrefab[row][col] = *reserve.value();
-                            (*reserve)++;
-                        }
-                    }
-                    map.piece->copy(tempPrefab);
-                }
-                
+            case PacketId::SC_PieceRotate: {
+                PieceRotatePacket packet = PieceRotatePacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.piece.has_value()) { map.piece.emplace(0, 0, 0); }
+                map.piece->rotateTo(packet.orientation);
                 break;
             }
-            case 5: { // Client type set.
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(1);
-                if (!reserve.has_value()) { return false; }
-                playerType = *reserve.value();
+            case PacketId::S_PrefabPushSucceed: {
+                PrefabPushSucceedPacket packet = PrefabPushSucceedPacket();
+                if (!packet.parse(client)) { return false; }
+                std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
+                break;
+            }
+            case PacketId::S_Tick: {
+                TickPacket packet = TickPacket();
+                if (!packet.parse(client)) { return false; }
+                map.grid = packet.grid;
+                map.piece = packet.piece;
                 break;
             }
             default: {
-                printf("Received unknown packet with ID %d from client.\n", *packetId.value());
+                printf("Received unknown packet with ID %d from client.\n", static_cast<uint8_t>(packetId.value_or(PacketId::Invalid)));
                 break;
             }
         }
@@ -307,33 +207,40 @@ int client(const char *ip, Uint16 port) {
                     switch (event.key.key) {
                         case SDLK_LEFT:
                         case SDLK_A: {
-                            if (!playerType.has_value() || playerType.value() != 0) { break; }
-                            std::vector<uint8_t> packet = std::vector<uint8_t>();
-                            packet.reserve(2);
-                            packet.push_back(1);
-                            packet.push_back(0);
-                            NET_WriteToStreamSocket(clientState.getSocket(), packet.data(), packet.size());
+                            if (event.key.repeat) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            PieceMovePacket packet = PieceMovePacket();
+                            packet.direction = PieceMovePacket::Direction::Left;
+                            PacketSender sender = PacketSender(PacketId::C_PieceMove, std::vector<uint8_t>());
+                            packet.build(sender.getMutableBuffer());
+                            sender.send(client.getSocket());
                             map.movePieceLeft();
                             break;
                         }
                         case SDLK_RIGHT:
                         case SDLK_D: {
-                            if (!playerType.has_value() || playerType.value() != 0) { break; }
-                            std::vector<uint8_t> packet = std::vector<uint8_t>();
-                            packet.reserve(2);
-                            packet.push_back(1);
-                            packet.push_back(1);
-                            NET_WriteToStreamSocket(clientState.getSocket(), packet.data(), packet.size());
+                            if (event.key.repeat) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            PieceMovePacket packet = PieceMovePacket();
+                            packet.direction = PieceMovePacket::Direction::Right;
+                            PacketSender sender = PacketSender(PacketId::C_PieceMove, std::vector<uint8_t>());
+                            packet.build(sender.getMutableBuffer());
+                            sender.send(client.getSocket());
                             map.movePieceRight();
                             break;
                         }
                         case SDLK_UP:
                         case SDLK_W:
                         case SDLK_R: {
-                            if (!playerType.has_value() || playerType.value() != 0) { break; }
-                            uint8_t packetId = 2;
-                            NET_WriteToStreamSocket(clientState.getSocket(), &packetId, 1);
+                            if (event.key.repeat) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             map.rotatePiece();
+
+                            PieceRotatePacket packet = PieceRotatePacket();
+                            packet.orientation = map.piece.has_value() ? map.piece->orientation : 0;
+                            PacketSender sender = PacketSender(PacketId::SC_PieceRotate, std::vector<uint8_t>());
+                            packet.build(sender.getMutableBuffer());
+                            sender.send(client.getSocket());
                             break;
                         }
                         case SDLK_S:
@@ -341,18 +248,18 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_SPACE:
                         case SDLK_LSHIFT:
                         case SDLK_RSHIFT: {
-                            if (!playerType.has_value() || playerType.value() != 0) { break; }
-                            if (!event.key.repeat) {
-                                std::vector<uint8_t> packet = std::vector<uint8_t>();
-                                packet.reserve(2);
-                                packet.push_back(0);
-                                packet.push_back(1);
-                                NET_WriteToStreamSocket(clientState.getSocket(), packet.data(), packet.size());
-                            }
+                            if (event.key.repeat) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            TickRateChangePacket packet = TickRateChangePacket();
+                            packet.fast = true;
+                            PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
+                            packet.build(sender.getMutableBuffer());
+                            sender.send(client.getSocket());
                             break;
                         }
                         case SDLK_RETURN: {
-                            if (!playerType.has_value() || playerType.value() != 1) { break; }
+                            if (event.key.repeat) { break; }
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             pushPrefabButtonCallback();
                             break;
                         }
@@ -369,12 +276,12 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_SPACE:
                         case SDLK_LSHIFT:
                         case SDLK_RSHIFT: {
-                            if (!playerType.has_value() || playerType.value() != 0) { break; }
-                            std::vector<uint8_t> packet = std::vector<uint8_t>();
-                            packet.reserve(2);
-                            packet.push_back(0);
-                            packet.push_back(0);
-                            NET_WriteToStreamSocket(clientState.getSocket(), packet.data(), packet.size());
+                            if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            TickRateChangePacket packet = TickRateChangePacket();
+                            packet.fast = false;
+                            PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
+                            packet.build(sender.getMutableBuffer());
+                            sender.send(client.getSocket());
                             break;
                         }
                         default: {
@@ -418,22 +325,23 @@ int client(const char *ip, Uint16 port) {
             tickTimer -= tickRate;
 
             uint8_t buffer[4096];
-            int bytesRead = NET_ReadFromStreamSocket(clientState.getSocket(), buffer, sizeof(buffer));
+            int bytesRead = NET_ReadFromStreamSocket(client.getSocket(), buffer, sizeof(buffer));
             if (bytesRead < 0) {
                 printf("Client disconnected.\n");
-                playerType = std::nullopt;
+                clientType = std::nullopt;
                 map = ClientMap();
                 std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
                 brush = 1;
                 continue;
             } else if (bytesRead > 0) {
-                clientState.append(buffer, static_cast<size_t>(bytesRead));
-                while (packetCallback(clientState));
+                client.receive(buffer, static_cast<size_t>(bytesRead));
+                while (packetCallback(client));
+                client.rewind();
             }
         }
 
         const float aspectRatio = windowWidth / windowHeight;
-        if (playerType.has_value() && playerType.value() == 1) {
+        if (clientType.has_value() && clientType.value() == ClientType::Builder) {
             for (size_t i = 0; i < toggles.size(); i++) {
                 Toggle &toggle = toggles[i];
                 // FIXME: For now here and in many places in the code, we assume that there's a canvas for prefab drawing at these coordinates and of a specific size, but in future it should be moved into a separate class and share info like it's position and size with the rest of the code.
@@ -478,7 +386,7 @@ int client(const char *ip, Uint16 port) {
         glClear(GL_COLOR_BUFFER_BIT);
         map.draw(projectionViewMatrix, aspectRatio);
 
-        if (playerType.has_value() && playerType.value() == 1) {
+        if (clientType.has_value() && clientType.value() == ClientType::Builder) {
             BasicShader::getInstance().bind();
             glBindVertexArray(MeshRegistry::getInstance().getQuad());
             glActiveTexture(GL_TEXTURE0);
@@ -537,103 +445,118 @@ int server(const char *ip, Uint16 port) {
     }
     printf("Server started on port %d.\n", port);
 
-    ServerMap map = ServerMap();
+    std::optional<ServerMap> map = std::nullopt;
     const float slowTickRate = 1.0f / 2.0f;
     const float fastTickRate = 1.0f / 12.0f;
     float tickRate = slowTickRate;
 
-    std::vector<std::unique_ptr<ClientState>> clients = std::vector<std::unique_ptr<ClientState>>();
-    std::array<ClientState*, 2> players = std::array<ClientState*, 2>();
-    std::function<bool(ClientState &client)> packetCallback = [&](ClientState &client) -> bool {
-        bool playersReady = true;
-        for (const ClientState *player : players) {
-            if (player == nullptr) {
-                playersReady = false; break;
-            }
-        }
-        std::optional<std::vector<uint8_t>::iterator> packetId = client.read(1);
+    std::vector<std::unique_ptr<PacketReceiver>> clients = std::vector<std::unique_ptr<PacketReceiver>>();
+    PacketReceiver *player = nullptr, *builder = nullptr;
+
+    std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
+        std::optional<PacketId> packetId = client.getPacketId();
         if (!packetId.has_value()) { return false; }
-        switch (*packetId.value()) {
-            case 0: { // Client asked for tick rate change.
-                if (!playersReady) {
-                    client.clear();
-                    return true;
+        switch (packetId.value()) {
+            case PacketId::SC_Handshake: {
+                HandshakePacket packet = HandshakePacket();
+                if (!packet.parse(client)) { return false; }
+                if (&client == player || &client == builder) { break; }
+
+                const uint32_t clientProtocolVersion = packet.protocolVersion;
+                packet.protocolVersion = Network::PROTOCOL_VERSION;
+                PacketSender sender = PacketSender(PacketId::SC_Handshake, std::vector<uint8_t>());
+                packet.build(sender.getMutableBuffer());
+                sender.send(client.getSocket());
+
+                if (clientProtocolVersion != Network::PROTOCOL_VERSION) {
+                    printf("Client has incompatible protocol version %d, expected %d.\n", clientProtocolVersion, Network::PROTOCOL_VERSION);
+                } else {
+                    printf("Client has compatible protocol version %d.\n", clientProtocolVersion);
+                    ClientTypeSetPacket responsePacket = ClientTypeSetPacket();
+                    if (player == nullptr) {
+                        player = &client;
+                        responsePacket.type = ClientType::Player;
+                    } else if (builder == nullptr) {
+                        builder = &client;
+                        responsePacket.type = ClientType::Builder;
+                    } else {
+                        responsePacket.type = ClientType::Spectator;
+                    }
+                    if (player != nullptr && builder != nullptr && !map.has_value()) {
+                        map.emplace();
+                    }
+                    PacketSender responseSender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
+                    responsePacket.build(responseSender.getMutableBuffer());
+                    responseSender.send(client.getSocket());
                 }
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(1);
-                if (!reserve.has_value()) { return false; }
-                bool fast = static_cast<bool>(*reserve.value());
-                tickRate = fast ? fastTickRate : slowTickRate;
                 break;
             }
-            case 1: { // Client asked to move piece horizontally.
-                if (!playersReady) {
-                    client.clear();
-                    return true;
-                }
-                std::optional<std::vector<uint8_t>::iterator> reserve = client.read(1);
-                if (!reserve.has_value()) { return false; }
-                bool right = static_cast<bool>(*reserve.value());
-                if (right) {
-                    map.movePieceRight();
+            case PacketId::C_PieceMove: {
+                PieceMovePacket packet = PieceMovePacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.has_value() || &client != player) { break; }
+
+                if (packet.direction == PieceMovePacket::Direction::Right) {
+                    map->movePieceRight();
                 } else {
-                    map.movePieceLeft();
+                    map->movePieceLeft();
                 }
 
-                std::vector<uint8_t> packet = std::vector<uint8_t>();
-                packet.reserve(3);
-                packet.push_back(*packetId.value());
-                const Piece *piece = map.getPiece();
-                std::vector<uint8_t>::iterator tempIt = packet.end();
-                packet.push_back(0); packet.push_back(0);
-                int16ToByteBuffer(piece != nullptr ? piece->x : 0, tempIt);
-                for (std::vector<std::unique_ptr<ClientState>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                    ClientState &otherClient = *it->get();
+                const Piece *piece = map->getPiece();
+                if (piece == nullptr) { break; }
+
+                PiecePositionPacket piecePositionPacket = PiecePositionPacket();
+                piecePositionPacket.x = piece->x;
+                PacketSender sender = PacketSender(PacketId::S_PiecePosition, std::vector<uint8_t>());
+                piecePositionPacket.build(sender.getMutableBuffer());
+                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                    PacketReceiver *otherClient = it->get();
+                    if (otherClient == &client) { continue; }
+                    sender.send(otherClient->getSocket());
+                }
+                break;
+            }
+            case PacketId::SC_PieceRotate: {
+                PieceRotatePacket packet = PieceRotatePacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.has_value() || &client != player) { break; }
+
+                map->rotatePiece();
+                const Piece *piece = map->getPiece();
+                if (piece == nullptr) { break; }
+
+                packet.orientation = piece->orientation;
+                PacketSender sender = PacketSender(PacketId::SC_PieceRotate, std::vector<uint8_t>());
+                packet.build(sender.getMutableBuffer());
+                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                    PacketReceiver &otherClient = *it->get();
                     if (&otherClient == &client) { continue; }
-                    NET_WriteToStreamSocket(otherClient.getSocket(), packet.data(), packet.size());
+                    sender.send(otherClient.getSocket());
                 }
                 break;
             }
-            case 2: { // Client asked to rotate piece.
-                if (!playersReady) {
-                    client.clear();
-                    return true;
-                }
-                map.rotatePiece();
-                const Piece *piece = map.getPiece();
-                if (piece != nullptr) {
-                    std::vector<uint8_t> packet = std::vector<uint8_t>();
-                    packet.reserve(2);
-                    packet.push_back(*packetId.value());
-                    packet.push_back(piece->orientation);
-                    for (std::vector<std::unique_ptr<ClientState>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                        ClientState &otherClient = *it->get();
-                        if (&otherClient == &client) { continue; }
-                        NET_WriteToStreamSocket(otherClient.getSocket(), packet.data(), packet.size());
-                    }
+            case PacketId::C_PrefabPush: {
+                PrefabPushPacket packet = PrefabPushPacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.has_value() || &client != builder) { break; }
+
+                if (map->pushPrefab(packet.prefab)) {
+                    PrefabPushSucceedPacket responsePacket = PrefabPushSucceedPacket();
+                    PacketSender sender = PacketSender(PacketId::S_PrefabPushSucceed, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
                 }
                 break;
             }
-            case 3: { // Client pushed prefab to the stack.
-                if (!playersReady) {
-                    client.clear();
-                    return true;
-                }
-                std::optional<std::vector<uint8_t>::iterator> lengthIt = client.read(Piece::width * Piece::height);
-                if (!lengthIt.has_value()) { return false; }
-                std::array<std::array<uint8_t, Piece::width>, Piece::height> prefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
-                std::vector<uint8_t>::iterator it = lengthIt.value();
-                for (size_t y = 0; y < Piece::height; y++) {
-                    for (size_t x = 0; x < Piece::width; x++) {
-                        prefab[y][x] = *(it++);
-                    }
-                }
-                if (map.pushPrefab(prefab)) {
-                    NET_WriteToStreamSocket(client.getSocket(), &(*packetId.value()), 1);
-                }
+            case PacketId::C_TickRateChange: {
+                TickRateChangePacket packet = TickRateChangePacket();
+                if (!packet.parse(client)) { return false; }
+                if (!map.has_value() || &client != player) { break; }
+                tickRate = packet.fast ? fastTickRate : slowTickRate;
                 break;
             }
             default: {
-                printf("Received unknown packet with ID %d from client.\n", *packetId.value());
+                printf("Received unknown packet with ID %d from client.\n", static_cast<uint8_t>(packetId.value_or(PacketId::Invalid)));
                 break;
             }
         }
@@ -648,51 +571,30 @@ int server(const char *ip, Uint16 port) {
     while (running) {
         NET_StreamSocket *socket = nullptr;
         while (NET_AcceptClient(server.get(), &socket) && socket != nullptr) {
-            clients.emplace_back(std::make_unique<ClientState>(socket, true));
-            for (size_t i = 0; i < players.size(); i++) {
-                if (players[i] == nullptr) {
-                    players[i] = clients.back().get();
-                    std::vector<uint8_t> packet = std::vector<uint8_t>();
-                    packet.reserve(2);
-                    packet.push_back(5);
-                    packet.push_back(static_cast<uint8_t>(i));
-                    NET_WriteToStreamSocket(clients.back()->getSocket(), packet.data(), packet.size());
-                    break;
-                }
-            }
+            clients.emplace_back(std::make_unique<PacketReceiver>(socket, true));
             printf("New client connected!\n");
             socket = nullptr;
         }
-
-        for (std::vector<std::unique_ptr<ClientState>>::iterator it = clients.begin(); it != clients.end(); ) {
-            ClientState &client = *it->get();
+        for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ) {
+            PacketReceiver &client = *it->get();
 
             uint8_t buffer[4096];
             int bytesRead = NET_ReadFromStreamSocket(client.getSocket(), buffer, sizeof(buffer));
             
             if (bytesRead < 0) {
                 printf("Client disconnected.\n");
-                for (size_t i = 0; i < players.size(); i++) {
-                    if (players[i] == &client) {
-                        players[i] = nullptr;
-                        break;
-                    }
+                if (&client == player) {
+                    player = nullptr;
+                } else if (&client == builder) {
+                    builder = nullptr;
                 }
                 it = clients.erase(it);
-                bool anyPlayersLeft = false;
-                for (const ClientState *player : players) {
-                    if (player != nullptr) {
-                        anyPlayersLeft = true;
-                        break;
-                    }
-                }
-                if (!anyPlayersLeft) {
-                    map = ServerMap();
-                }
+                if (player == nullptr && builder == nullptr) { map = ServerMap(); }
                 continue;
             } else if (bytesRead > 0) {
-                client.append(buffer, static_cast<size_t>(bytesRead));
+                client.receive(buffer, static_cast<size_t>(bytesRead));
                 while (packetCallback(client));
+                client.rewind();
             }
             ++it;
         }
@@ -703,46 +605,21 @@ int server(const char *ip, Uint16 port) {
         tickTimer += deltaTime;
         if (tickTimer >= tickRate) {
             tickTimer -= tickRate;
-            bool playersReady = true;
-            for (const ClientState *player : players) {
-                if (player == nullptr) {
-                    playersReady = false;
-                    break;
-                }
-            }
-            if (playersReady) {
-                map.tick();
+            if (map.has_value()) {
+                map->tick();
     
-                std::vector<uint8_t> packet = std::vector<uint8_t>();
-                packet.reserve(1 + Map::width * Map::height + 6 + Piece::width * Piece::height);
-                packet.push_back(4);
-                for (const std::array<uint8_t, Map::width> &row : map.getGrid()) {
-                    for (const uint8_t cell : row) {
-                        packet.push_back(cell);
-                    }
-                }
-                const Piece *piece = map.getPiece();
-                if (piece != nullptr) {
-                    packet.push_back(1);
-                    std::vector<uint8_t>::iterator it = packet.end();
-                    for (size_t i = 0; i < 4; i++) {
-                        packet.push_back(0);
-                    }
-                    int16ToByteBuffer(piece->x, it); it += 2;
-                    int16ToByteBuffer(piece->y, it); it += 2;
-                    packet.push_back(piece->orientation);
-                    for (size_t row = 0; row < Piece::height; row++) {
-                        for (size_t col = 0; col < Piece::width; col++) {
-                            packet.push_back(piece->getPrefabCell(row, col));
-                        }
-                    }
-                } else {
-                    packet.push_back(0);
-                }
+                // FIXME: The ideas: send only the changes, allow the client to move the piece locally and only fix it when it's far enough from the real position - look below for more details:
+                // 1. Instead of sending the entire grid and piece every tick, we should only send the changes (deltas) to reduce bandwidth usage.
+                // 2. Instead of requiring the client to just ask the server to move the piece and receive the new world state, we should allow the client to move the piece locally and only send the new world state when the piece is far enough from the real position, to reduce latency and make the game feel more responsive, while keeping it safe from cheating.
+                TickPacket tickPacket = TickPacket();
+                tickPacket.grid = map->getGrid();
+                tickPacket.piece = *map->getPiece();
     
-                for (std::vector<std::unique_ptr<ClientState>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                    ClientState &client = *it->get();
-                    NET_WriteToStreamSocket(client.getSocket(), packet.data(), packet.size());
+                PacketSender sender = PacketSender(PacketId::S_Tick, std::vector<uint8_t>());
+                tickPacket.build(sender.getMutableBuffer());
+                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                    PacketReceiver &client = *it->get();
+                    sender.send(client.getSocket());
                 }
             }
         }
