@@ -174,6 +174,7 @@ int client(const char *ip, Uint16 port) {
                 map = ClientMap();
                 map.reseed(packet.seed);
                 map.showPiece();
+                map.rebuildGhost();
                 tickRate = GameProperties::SLOW_TICK_RATE;
                 tickTimer = 0.0f;
                 gameStarted = true;
@@ -214,6 +215,7 @@ int client(const char *ip, Uint16 port) {
 
                 map.grid = packet.grid;
                 map.piece = packet.piece;
+                map.rebuildGhost();
                 break;
             }
             default: {
@@ -257,6 +259,7 @@ int client(const char *ip, Uint16 port) {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             map.movePieceLeft();
+                            map.rebuildGhost();
                             stateDirty = true;
                             break;
                         }
@@ -265,6 +268,7 @@ int client(const char *ip, Uint16 port) {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             map.movePieceRight();
+                            map.rebuildGhost();
                             stateDirty = true;
                             break;
                         }
@@ -274,6 +278,7 @@ int client(const char *ip, Uint16 port) {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             map.rotatePiece();
+                            map.rebuildGhost();
                             stateDirty = true;
                             break;
                         }
@@ -389,7 +394,10 @@ int client(const char *ip, Uint16 port) {
                 tickTimer -= 1.0f;
                 // The next piece comes straight out of the local sequence, so a lock
                 // no longer costs a round trip before the player can act again.
-                if (!map.piece.has_value()) { map.showPiece(); }
+                if (!map.piece.has_value()) {
+                    map.showPiece();
+                    map.rebuildGhost();
+                }
                 map.tick();
                 stateDirty = true;
             }

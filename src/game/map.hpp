@@ -16,7 +16,7 @@ public:
     
     std::array<std::array<uint8_t, Map::width>, Map::height> grid;
     std::optional<Piece> piece;
-private:
+protected:
     std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
     Random random;
     bool pieceLanded = false;
@@ -191,9 +191,21 @@ public:
     }
 };
 class ClientMap : public Map {
+private:
+    std::optional<Piece> ghost;
 public:
-    ClientMap() = default;
+    ClientMap() : Map(), ghost(std::nullopt) {}
     ~ClientMap() = default;
+
+    void rebuildGhost() {
+        if (!this->piece.has_value()) { return; }
+        this->ghost = *this->piece;
+
+        while (!this->checkFuturePieceCollisions(this->ghost->x, this->ghost->y)) {
+            this->ghost->y--;
+        }
+        this->ghost->y++;
+    }
 
     void draw(const glm::mat4 &projectionViewMatrix, float aspectRatio) const {
         BasicShader::getInstance().bind();
@@ -230,6 +242,24 @@ public:
 
                 const float uvX = std::fmodf(static_cast<float>(this->piece->getCell(row, col)), 3.0f) * uvSize;
                 const float uvY = std::floorf(static_cast<float>(this->piece->getCell(row, col)) / 3.0f) * uvSize;
+                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            }
+        }
+        if (!this->ghost.has_value()) { return; }
+        glBindTexture(GL_TEXTURE_2D, TextureRegistry::getInstance().getAtlasTransparentTexture());
+        for (size_t row = 0; row < Piece::height; row++) {
+            for (size_t col = 0; col < Piece::width; col++) {
+                if (this->ghost->getCell(row, col) == 0) { continue; }
+
+                const float x = -aspectRatio + gridX + (col + this->ghost->x) * cellSize;
+                const float y = -1.0f + (row + this->ghost->y) * cellSize;
+                const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
+                BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+
+                const float uvX = std::fmodf(static_cast<float>(this->ghost->getCell(row, col)), 3.0f) * uvSize;
+                const float uvY = std::floorf(static_cast<float>(this->ghost->getCell(row, col)) / 3.0f) * uvSize;
                 BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
 
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
