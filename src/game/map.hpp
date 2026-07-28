@@ -18,6 +18,7 @@ public:
     std::optional<Piece> piece;
 private:
     std::vector<std::array<std::array<uint8_t, Piece::width>, Piece::height>> prefabStack;
+    Random random;
     bool pieceLanded = false;
     bool justSpawnedPiece = false;
 
@@ -74,8 +75,15 @@ private:
         }
     }
 public:
-    Map() : grid(), piece(std::nullopt), pieceLanded(false), justSpawnedPiece(false) {}
+    // ! The map starts with a placeholder seed. Whoever owns the game is expected to
+    // ! call reseed() with the server-issued seed before the first piece spawns,
+    // ! otherwise every session deals the same pieces.
+    Map() : grid(), piece(std::nullopt), random(0), pieceLanded(false), justSpawnedPiece(false) {}
     virtual ~Map() = default;
+
+    void reseed(const uint32_t seed) {
+        this->random = Random(seed);
+    }
 
     bool pushPrefab(const std::array<std::array<uint8_t, Piece::width>, Piece::height> &prefab) {
         // ! Let's for now keep one prefab at a time, maybe I'll do something fun with it later.
@@ -89,8 +97,17 @@ public:
     }
     void showPiece() {
         if (this->piece.has_value()) { return; }
-        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, rand() % 4);
-        this->piece->copy(this->prefabStack.empty() ? Piece::defaultShapes[rand() % Piece::defaultShapes.size()] : this->prefabStack.back());
+        // I absolutely understand this solution, it's completely okay and makes sense.
+        // Thanks to Claude Code:
+        // ! Both values are drawn unconditionally, even when a prefab overrides the
+        // ! shape. Otherwise the number of generator calls would depend on when the
+        // ! builder happened to push, and the sequence would no longer be reproducible
+        // ! from the seed alone.
+        const uint8_t orientation = static_cast<uint8_t>(this->random.nextBelow(4));
+        const size_t shapeIndex = static_cast<size_t>(this->random.nextBelow(static_cast<uint32_t>(Piece::defaultShapes.size())));
+
+        this->piece = Piece(Map::width / 2 - Piece::width / 2, Map::height - Piece::height, orientation);
+        this->piece->copy(this->prefabStack.empty() ? Piece::defaultShapes[shapeIndex] : this->prefabStack.back());
         // this->resolvePieceCollisions(); // ! It makes no sense here, it automatically resolves the collisions and mostly avoids player to fail, by "clipping" out of the other pieces.
         this->popPrefab();
         this->justSpawnedPiece = true;

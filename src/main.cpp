@@ -82,7 +82,6 @@ int client(const char *ip, Uint16 port) {
     uint8_t mouseButtonsBitmask = 0;
     glm::vec2 mousePosition = glm::vec2();
 
-    srand(static_cast<unsigned int>(SDL_GetTicksNS()));
     ClientMap map = ClientMap();
     std::array<std::array<uint8_t, Piece::width>, Piece::height> prefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
     uint8_t brush = 1;
@@ -122,7 +121,7 @@ int client(const char *ip, Uint16 port) {
         success:
         PrefabPushPacket packet = PrefabPushPacket();
         packet.prefab = prefab;
-        PacketSender sender = PacketSender(PacketId::C_PrefabPush, std::vector<uint8_t>());
+        PacketSender sender = PacketSender(PacketId::SC_PrefabPush, std::vector<uint8_t>());
         packet.build(sender.getMutableBuffer());
         sender.send(client.getSocket());
     };
@@ -133,6 +132,13 @@ int client(const char *ip, Uint16 port) {
 
     float networkTickRate = 1.0f / 60.0f, networkTickTimer = 0.0f;
     float tickRate = GameProperties::SLOW_TICK_RATE, tickTimer = 0.0f;
+
+    // Only meaningful for a player: it holds the one authoritative simulation, and
+    // may not start running it until the server has handed over the seed.
+    bool gameStarted = false;
+    // Set by anything that changes the simulation, so the resulting state goes out
+    // once per network tick instead of once per input.
+    bool stateDirty = false;
 
     std::optional<ClientType> clientType = std::nullopt;
     std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
@@ -151,21 +157,28 @@ int client(const char *ip, Uint16 port) {
                 ClientTypeSetPacket packet = ClientTypeSetPacket();
                 if (!packet.parse(client)) { return false; }
                 clientType = packet.type;
-                printf("Client type set to %s.\n", clientType.value() == ClientType::Player ? "Player" : "Builder");
+                switch (clientType.value()) {
+                    case ClientType::Player:    printf("Client type set to Player.\n"); break;
+                    case ClientType::Builder:   printf("Client type set to Builder.\n"); break;
+                    case ClientType::Spectator: printf("Client type set to Spectator.\n"); break;
+                    default:                    printf("Client type set to an unknown value.\n"); break;
+                }
                 break;
             }
-            case PacketId::S_PiecePosition: {
-                PiecePositionPacket packet = PiecePositionPacket();
+            case PacketId::S_GameStart: {
+                GameStartPacket packet = GameStartPacket();
                 if (!packet.parse(client)) { return false; }
-                if (!map.piece.has_value()) { map.piece.emplace(0, 0, 0); }
-                map.piece->x = packet.x;
-                break;
-            }
-            case PacketId::SC_PieceRotate: {
-                PieceRotatePacket packet = PieceRotatePacket();
-                if (!packet.parse(client)) { return false; }
-                if (!map.piece.has_value()) { map.piece.emplace(0, 0, 0); }
-                map.piece->rotateTo(packet.orientation);
+
+                // The seed is the whole handover. From here the piece sequence is
+                // ours to generate, so nothing in the game needs a round trip again.
+                map = ClientMap();
+                map.reseed(packet.seed);
+                map.showPiece();
+                tickRate = GameProperties::SLOW_TICK_RATE;
+                tickTimer = 0.0f;
+                gameStarted = true;
+                stateDirty = true;
+                printf("Game started with seed %u.\n", packet.seed);
                 break;
             }
             case PacketId::S_PrefabPushSucceed: {
@@ -174,21 +187,41 @@ int client(const char *ip, Uint16 port) {
                 std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
                 break;
             }
-            case PacketId::S_Tick: {
-                TickPacket packet = TickPacket();
+            case PacketId::SC_PrefabPush: {
+                PrefabPushPacket packet = PrefabPushPacket();
                 if (!packet.parse(client)) { return false; }
+                // ! Only the player keeps a prefab stack, because only the player
+                // ! spawns pieces out of it. Anyone else receiving this would be
+                // ! feeding a simulation they do not run.
+                if (!gameStarted || !clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+
+                // Whether it fits is ours to decide and the builder's to hear about,
+                // so the answer goes back the way the prefab came.
+                PrefabPushResultPacket responsePacket = PrefabPushResultPacket();
+                responsePacket.accepted = map.pushPrefab(packet.prefab);
+                PacketSender sender = PacketSender(PacketId::C_PrefabPushResult, std::vector<uint8_t>());
+                responsePacket.build(sender.getMutableBuffer());
+                sender.send(client.getSocket());
+                break;
+            }
+            case PacketId::SC_MapState: {
+                MapStatePacket packet = MapStatePacket();
+                if (!packet.parse(client)) { return false; }
+                // ! A player must never take a relayed state: it is the authority, and
+                // ! overwriting its own simulation with an echo is exactly the jitter
+                // ! this whole design exists to remove.
+                if (clientType.has_value() && clientType.value() == ClientType::Player) { break; }
+
                 map.grid = packet.grid;
                 map.piece = packet.piece;
                 break;
             }
-            case PacketId::S_SpawnPiece: {
-                SpawnPiecePacket packet = SpawnPiecePacket();
-                if (!packet.parse(client)) { return false; }
-                map.piece = packet.piece;
-                break;
-            }
             default: {
-                printf("Received unknown packet with ID %d from client.\n", static_cast<uint8_t>(packetId.value_or(PacketId::Invalid)));
+                // Nothing to do: the length prefix tells flush() exactly how many
+                // bytes this packet occupies, so it is skipped whole and the stream
+                // carries on undisturbed.
+                printf("Skipping unknown packet with ID %d and %d bytes of payload.\n",
+                    static_cast<int>(packetId.value_or(PacketId::Invalid)), static_cast<int>(client.getPacketLength()));
                 break;
             }
         }
@@ -216,28 +249,23 @@ int client(const char *ip, Uint16 port) {
                 }
                 case SDL_EVENT_KEY_DOWN: {
                     switch (event.key.key) {
+                        // Every one of these acts on the local simulation and nothing
+                        // else. There is no request, no acknowledgement and no wait:
+                        // the piece has already moved by the time the frame is drawn.
                         case SDLK_LEFT:
                         case SDLK_A: {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
-                            PieceMovePacket packet = PieceMovePacket();
-                            packet.direction = PieceMovePacket::Direction::Left;
-                            PacketSender sender = PacketSender(PacketId::C_PieceMove, std::vector<uint8_t>());
-                            packet.build(sender.getMutableBuffer());
-                            sender.send(client.getSocket());
                             map.movePieceLeft();
+                            stateDirty = true;
                             break;
                         }
                         case SDLK_RIGHT:
                         case SDLK_D: {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
-                            PieceMovePacket packet = PieceMovePacket();
-                            packet.direction = PieceMovePacket::Direction::Right;
-                            PacketSender sender = PacketSender(PacketId::C_PieceMove, std::vector<uint8_t>());
-                            packet.build(sender.getMutableBuffer());
-                            sender.send(client.getSocket());
                             map.movePieceRight();
+                            stateDirty = true;
                             break;
                         }
                         case SDLK_UP:
@@ -246,12 +274,7 @@ int client(const char *ip, Uint16 port) {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             map.rotatePiece();
-
-                            PieceRotatePacket packet = PieceRotatePacket();
-                            packet.orientation = map.piece.has_value() ? map.piece->orientation : 0;
-                            PacketSender sender = PacketSender(PacketId::SC_PieceRotate, std::vector<uint8_t>());
-                            packet.build(sender.getMutableBuffer());
-                            sender.send(client.getSocket());
+                            stateDirty = true;
                             break;
                         }
                         case SDLK_S:
@@ -261,12 +284,9 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_RSHIFT: {
                             if (event.key.repeat) { break; }
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
+                            // Nobody else needs to know how fast we are dropping; the
+                            // resulting positions are reported like any other change.
                             tickRate = GameProperties::FAST_TICK_RATE;
-                            TickRateChangePacket packet = TickRateChangePacket();
-                            packet.fast = true;
-                            PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
-                            packet.build(sender.getMutableBuffer());
-                            sender.send(client.getSocket());
                             break;
                         }
                         case SDLK_RETURN: {
@@ -290,11 +310,6 @@ int client(const char *ip, Uint16 port) {
                         case SDLK_RSHIFT: {
                             if (!clientType.has_value() || clientType.value() != ClientType::Player) { break; }
                             tickRate = GameProperties::SLOW_TICK_RATE;
-                            TickRateChangePacket packet = TickRateChangePacket();
-                            packet.fast = false;
-                            PacketSender sender = PacketSender(PacketId::C_TickRateChange, std::vector<uint8_t>());
-                            packet.build(sender.getMutableBuffer());
-                            sender.send(client.getSocket());
                             break;
                         }
                         default: {
@@ -345,29 +360,38 @@ int client(const char *ip, Uint16 port) {
                 map = ClientMap();
                 std::fill(prefab.begin(), prefab.end(), std::array<uint8_t, Piece::width>());
                 brush = 1;
+                gameStarted = false;
+                stateDirty = false;
                 continue;
             } else if (bytesRead > 0) {
                 client.receive(buffer, static_cast<size_t>(bytesRead));
                 while (packetCallback(client));
                 client.rewind();
             }
+
+            // Report the simulation at most once per network tick, so a flurry of
+            // inputs inside one frame costs a single packet rather than one each.
+            if (stateDirty && clientType.has_value() && clientType.value() == ClientType::Player) {
+                stateDirty = false;
+
+                MapStatePacket packet = MapStatePacket();
+                packet.grid = map.grid;
+                packet.piece = map.piece;
+                PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
+                packet.build(sender.getMutableBuffer());
+                sender.send(client.getSocket());
+            }
         }
 
-        if (clientType.has_value() && clientType.value() == ClientType::Player) {
-            tickTimer += deltaTime;
-            if (tickTimer >= tickRate) {
-                tickTimer -= tickRate;
+        if (gameStarted && clientType.has_value() && clientType.value() == ClientType::Player) {
+            tickTimer += deltaTime / tickRate;
+            if (tickTimer >= 1.0f) {
+                tickTimer -= 1.0f;
+                // The next piece comes straight out of the local sequence, so a lock
+                // no longer costs a round trip before the player can act again.
+                if (!map.piece.has_value()) { map.showPiece(); }
                 map.tick();
-                
-                if (map.piece.has_value()) {
-                    TickDeltaPacket packet = TickDeltaPacket();
-                    packet.x = map.piece->x;
-                    packet.y = map.piece->y;
-                    packet.orientation = map.piece->orientation;
-                    PacketSender sender = PacketSender(PacketId::C_TickDelta, std::vector<uint8_t>());
-                    packet.build(sender.getMutableBuffer());
-                    sender.send(client.getSocket());
-                }
+                stateDirty = true;
             }
         }
 
@@ -476,12 +500,75 @@ int server(const char *ip, Uint16 port) {
     }
     printf("Server started on port %d.\n", port);
 
-    std::optional<Map> map = std::nullopt;
-    float tickRate = GameProperties::SLOW_TICK_RATE;
+    // ! The server does not simulate. The player's client owns the one and only
+    // ! simulation, and everything here is either a relay or a cache of what the
+    // ! player last reported, so that late joiners have something to draw.
+    std::optional<MapStatePacket> lastPlayerState = std::nullopt;
+    bool gameStarted = false;
+    Random serverRandom = Random(static_cast<uint32_t>(SDL_GetTicksNS()));
 
     std::vector<std::unique_ptr<PacketReceiver>> clients = std::vector<std::unique_ptr<PacketReceiver>>();
     PacketReceiver *player = nullptr, *builder = nullptr;
-    uint8_t playerWarnings = 0;
+
+    // ! This is bug containment, not anti-cheat. A co-op game has nobody to cheat
+    // ! against, and correcting the player is exactly the behaviour that made the
+    // ! game feel bad in the first place, so a failed check is only ever reported.
+    // ! Compares against lastPlayerState, so it must run before that is replaced.
+    std::string lastValidationWarning;
+    std::function<void(const MapStatePacket &)> validatePlayerState = [&](const MapStatePacket &state) {
+        char warning[256];
+        warning[0] = '\0';
+
+        // The cells are drawn from a 3x3 atlas, so 8 is the highest value that has
+        // a texture behind it.
+        static constexpr uint8_t maxCellValue = 8;
+        size_t filled = 0;
+        for (const std::array<uint8_t, Map::width> &row : state.grid) {
+            for (const uint8_t cell : row) {
+                if (cell != 0) { filled++; }
+                if (cell > maxCellValue && warning[0] == '\0') {
+                    snprintf(warning, sizeof(warning), "grid holds cell value %d, above the %d the atlas can draw", static_cast<int>(cell), static_cast<int>(maxCellValue));
+                }
+            }
+        }
+
+        if (warning[0] == '\0' && state.piece.has_value()) {
+            const int x = static_cast<int>(state.piece->x), y = static_cast<int>(state.piece->y);
+            if (
+                x < -static_cast<int>(Piece::width) || x > static_cast<int>(Map::width) ||
+                y < -static_cast<int>(Piece::height) || y > static_cast<int>(Map::height)
+            ) {
+                snprintf(warning, sizeof(warning), "piece sits outside the board at (%d, %d)", x, y);
+            }
+        }
+
+        if (warning[0] == '\0' && lastPlayerState.has_value()) {
+            size_t previousFilled = 0;
+            for (const std::array<uint8_t, Map::width> &row : lastPlayerState->grid) {
+                for (const uint8_t cell : row) {
+                    if (cell != 0) { previousFilled++; }
+                }
+            }
+            // A single update can only ever lock one piece into the grid. Line clears
+            // shrink the count rather than growing it, so a jump bigger than a piece
+            // means the two sides disagree about something.
+            const size_t maxGrowth = Piece::width * Piece::height;
+            if (filled > previousFilled + maxGrowth) {
+                snprintf(warning, sizeof(warning), "grid gained %zu cells in one update, more than the %zu a single piece can add", filled - previousFilled, maxGrowth);
+            }
+        }
+
+        // A state update arrives up to sixty times a second, so repeating an unchanged
+        // complaint would bury every other message. Each distinct one is said once.
+        if (warning[0] != '\0') {
+            if (lastValidationWarning != warning) {
+                lastValidationWarning = warning;
+                printf("[validation] %s\n", warning);
+            }
+        } else {
+            lastValidationWarning.clear();
+        }
+    };
 
     std::function<bool(PacketReceiver &client)> packetCallback = [&](PacketReceiver &client) -> bool {
         std::optional<PacketId> packetId = client.getPacketId();
@@ -514,121 +601,87 @@ int server(const char *ip, Uint16 port) {
                     } else {
                         responsePacket.type = ClientType::Spectator;
                     }
-                    if (player != nullptr && builder != nullptr && !map.has_value()) {
-                        map.emplace();
-                        map->showPiece();
-                        SpawnPiecePacket spawnPiecePacket = SpawnPiecePacket();
-                        spawnPiecePacket.piece = map->piece.value();
-                        PacketSender sender = PacketSender(PacketId::S_SpawnPiece, std::vector<uint8_t>());
-                        spawnPiecePacket.build(sender.getMutableBuffer());
-                        sender.send(player->getSocket());
+                    {
+                        PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
+                        responsePacket.build(sender.getMutableBuffer());
+                        sender.send(client.getSocket());
                     }
-                    PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
-                    responsePacket.build(sender.getMutableBuffer());
-                    sender.send(client.getSocket());
+
+                    // Anyone who is not the player only ever watches, so hand a
+                    // newcomer the last known board immediately instead of leaving
+                    // it staring at an empty field until the player next moves.
+                    if (&client != player && lastPlayerState.has_value()) {
+                        PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
+                        lastPlayerState->build(sender.getMutableBuffer());
+                        sender.send(client.getSocket());
+                    }
+
+                    // The game exists only while somebody is simulating it, so it
+                    // begins as soon as there is both a player to run it and a
+                    // builder to feed it. The seed is all the player needs to
+                    // produce the whole piece sequence on its own.
+                    if (player != nullptr && builder != nullptr && !gameStarted) {
+                        gameStarted = true;
+                        lastPlayerState.reset();
+
+                        GameStartPacket gameStartPacket = GameStartPacket();
+                        gameStartPacket.seed = serverRandom.next();
+                        PacketSender sender = PacketSender(PacketId::S_GameStart, std::vector<uint8_t>());
+                        gameStartPacket.build(sender.getMutableBuffer());
+                        sender.send(player->getSocket());
+                        printf("Game started with seed %u.\n", gameStartPacket.seed);
+                    }
                 }
                 break;
             }
-            case PacketId::C_PieceMove: {
-                PieceMovePacket packet = PieceMovePacket();
+            case PacketId::SC_MapState: {
+                MapStatePacket packet = MapStatePacket();
                 if (!packet.parse(client)) { return false; }
-                if (!map.has_value() || &client != player) { break; }
+                // ! Only the player simulates. Anyone else claiming to is ignored,
+                // ! which is what keeps a builder or spectator from driving the board.
+                if (&client != player) { break; }
 
-                if (packet.direction == PieceMovePacket::Direction::Right) {
-                    map->movePieceRight();
-                } else {
-                    map->movePieceLeft();
-                }
+                validatePlayerState(packet);
+                lastPlayerState = packet;
 
-                if (!map->piece.has_value()) { break; }
-
-                PiecePositionPacket piecePositionPacket = PiecePositionPacket();
-                piecePositionPacket.x = map->piece->x;
-                PacketSender sender = PacketSender(PacketId::S_PiecePosition, std::vector<uint8_t>());
-                piecePositionPacket.build(sender.getMutableBuffer());
+                PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
+                packet.build(sender.getMutableBuffer());
                 for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
                     PacketReceiver *otherClient = it->get();
-                    if (otherClient == &client) { continue; }
+                    if (otherClient == player) { continue; }
                     sender.send(otherClient->getSocket());
                 }
                 break;
             }
-            case PacketId::SC_PieceRotate: {
-                PieceRotatePacket packet = PieceRotatePacket();
-                if (!packet.parse(client)) { return false; }
-                if (!map.has_value() || &client != player) { break; }
-
-                map->rotatePiece();
-                if (!map->piece.has_value()) { break; }
-                const Piece *piece = &map->piece.value();
-
-                packet.orientation = piece->orientation;
-                PacketSender sender = PacketSender(PacketId::SC_PieceRotate, std::vector<uint8_t>());
-                packet.build(sender.getMutableBuffer());
-                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                    PacketReceiver &otherClient = *it->get();
-                    if (&otherClient == &client) { continue; }
-                    sender.send(otherClient.getSocket());
-                }
-                break;
-            }
-            case PacketId::C_PrefabPush: {
+            case PacketId::SC_PrefabPush: {
                 PrefabPushPacket packet = PrefabPushPacket();
                 if (!packet.parse(client)) { return false; }
-                if (!map.has_value() || &client != builder) { break; }
+                if (&client != builder || player == nullptr) { break; }
 
-                if (map->pushPrefab(packet.prefab)) {
-                    PrefabPushSucceedPacket responsePacket = PrefabPushSucceedPacket();
-                    PacketSender sender = PacketSender(PacketId::S_PrefabPushSucceed, std::vector<uint8_t>());
-                    responsePacket.build(sender.getMutableBuffer());
-                    sender.send(client.getSocket());
-                }
+                // The server no longer owns the prefab stack, so it cannot say
+                // whether this fits. Hand it to the player and let it answer.
+                PacketSender sender = PacketSender(PacketId::SC_PrefabPush, std::vector<uint8_t>());
+                packet.build(sender.getMutableBuffer());
+                sender.send(player->getSocket());
                 break;
             }
-            case PacketId::C_TickDelta: {
-                TickDeltaPacket packet = TickDeltaPacket();
+            case PacketId::C_PrefabPushResult: {
+                PrefabPushResultPacket packet = PrefabPushResultPacket();
                 if (!packet.parse(client)) { return false; }
-                if (!map.has_value() || &client != player) { break; }
+                if (&client != player || builder == nullptr || !packet.accepted) { break; }
 
-                if (!map->piece.has_value()) { break; }
-                // FIXME: Probably not the best solution, but for now it's enough I think for cases with <100ms latency, I don't think someone will seriously click more than 10 times per second.
-                int distance = (3.0f / GameProperties::SLOW_TICK_RATE) * tickRate;
-                if (
-                    std::abs(map->piece->x - packet.x) > 2 ||
-                    std::abs(map->piece->y - packet.y) > 2 ||
-                    map->piece->orientation != packet.orientation
-                ) {
-                    playerWarnings++;
-                    if (playerWarnings >= 3) {
-                        TickPacket tickPacket = TickPacket();
-                        tickPacket.grid = map->grid;
-                        tickPacket.piece = map->piece;
-                        PacketSender sender = PacketSender(PacketId::S_Tick, std::vector<uint8_t>());
-                        tickPacket.build(sender.getMutableBuffer());
-                        sender.send(client.getSocket());
-                        playerWarnings = 0;
-                    }
-                    break;
-                } else {
-                    playerWarnings = 0;
-                }
-                map->piece->x = packet.x;
-                map->piece->y = packet.y;
-                // Ensures that the collision will be handled correctly.
-                while (map->piece->orientation != packet.orientation) {
-                    map->rotatePiece();
-                }
-                break;
-            }
-            case PacketId::C_TickRateChange: {
-                TickRateChangePacket packet = TickRateChangePacket();
-                if (!packet.parse(client)) { return false; }
-                if (!map.has_value() || &client != player) { break; }
-                tickRate = packet.fast ? GameProperties::FAST_TICK_RATE : GameProperties::SLOW_TICK_RATE;
+                PrefabPushSucceedPacket responsePacket = PrefabPushSucceedPacket();
+                PacketSender sender = PacketSender(PacketId::S_PrefabPushSucceed, std::vector<uint8_t>());
+                responsePacket.build(sender.getMutableBuffer());
+                sender.send(builder->getSocket());
                 break;
             }
             default: {
-                printf("Received unknown packet with ID %d from client.\n", static_cast<uint8_t>(packetId.value_or(PacketId::Invalid)));
+                // Nothing to do: the length prefix tells flush() exactly how many
+                // bytes this packet occupies, so it is skipped whole and the stream
+                // carries on undisturbed.
+                printf("Skipping unknown packet with ID %d and %d bytes of payload.\n",
+                    static_cast<int>(packetId.value_or(PacketId::Invalid)), static_cast<int>(client.getPacketLength()));
                 break;
             }
         }
@@ -637,8 +690,6 @@ int server(const char *ip, Uint16 port) {
         return true;
     };
 
-    float tickTimer = 0.0f;
-    Uint64 lastTime = SDL_GetTicksNS();
     bool running = true;
     while (running) {
         NET_StreamSocket *socket = nullptr;
@@ -656,13 +707,17 @@ int server(const char *ip, Uint16 port) {
             if (bytesRead < 0) {
                 printf("Client disconnected.\n");
                 if (&client == player) {
+                    // The player held the only simulation, so losing it ends the
+                    // game. Clearing the flag lets the next player to connect
+                    // start a fresh one with a new seed.
                     player = nullptr;
+                    gameStarted = false;
                 } else if (&client == builder) {
                     builder = nullptr;
                 }
                 it = clients.erase(it);
-                if (player == nullptr && builder == nullptr) {
-                    map = std::nullopt;
+                if (clients.empty()) {
+                    lastPlayerState = std::nullopt;
                 }
                 continue;
             } else if (bytesRead > 0) {
@@ -672,43 +727,9 @@ int server(const char *ip, Uint16 port) {
             }
             ++it;
         }
-        
-        Uint64 currentTime = SDL_GetTicksNS();
-        const float deltaTime = static_cast<float>(currentTime - lastTime) / 1e9f;
-        lastTime = currentTime;
-        tickTimer += deltaTime;
-        if (tickTimer >= tickRate) {
-            tickTimer -= tickRate;
-            if (map.has_value()) {
-                if (!map->piece.has_value()) {
-                    map->showPiece();
-                    if (player != nullptr) {
-                        SpawnPiecePacket spawnPiecePacket = SpawnPiecePacket();
-                        spawnPiecePacket.piece = map->piece.value();
-                        PacketSender sender = PacketSender(PacketId::S_SpawnPiece, std::vector<uint8_t>());
-                        spawnPiecePacket.build(sender.getMutableBuffer());
-                        sender.send(player->getSocket());
-                    }
-                }
-                bool mapUpdated = map->tick();
-    
-                // FIXME: The ideas: send only the changes, allow the client to move the piece locally and only fix it when it's far enough from the real position - look below for more details:
-                // 1. Instead of sending the entire grid and piece every tick, we should only send the changes (deltas) to reduce bandwidth usage.
-                // 2. Instead of requiring the client to just ask the server to move the piece and receive the new world state, we should allow the client to move the piece locally and only send the new world state when the piece is far enough from the real position, to reduce latency and make the game feel more responsive, while keeping it safe from cheating.
-                TickPacket tickPacket = TickPacket();
-                tickPacket.grid = map->grid;
-                tickPacket.piece = map->piece;
-    
-                PacketSender sender = PacketSender(PacketId::S_Tick, std::vector<uint8_t>());
-                tickPacket.build(sender.getMutableBuffer());
-                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                    PacketReceiver &client = *it->get();
-                    if (!mapUpdated && &client == player) { continue; }
-                    sender.send(client.getSocket());
-                }
-            }
-        }
 
+        // Nothing here advances the game any more: without a simulation the server
+        // only has to wake up often enough to move packets along.
         SDL_Delay(static_cast<Uint32>(1000.0f / 60.0f));
     }
 

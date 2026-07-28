@@ -5,6 +5,33 @@
 #include <algorithm>
 #include <glm/vec4.hpp>
 
+// Thanks to Claude Code:
+// Deterministic pseudo-random generator.
+// ! Do not replace this with rand(): its sequence, and even its RAND_MAX, differ
+// ! between C libraries, so two machines seeded identically would still disagree.
+// ! xorshift32 is plain fixed-width integer arithmetic, so it is bit-identical
+// ! everywhere, which is what lets the client generate the same pieces the server
+// ! would have, without asking it.
+struct Random {
+private:
+    uint32_t state;
+public:
+    explicit Random(const uint32_t seed) : state(seed == 0 ? 0x9E3779B9u : seed) {}
+
+    uint32_t next() {
+        // ! Zero is a fixed point of xorshift, hence the guard in the constructor.
+        this->state ^= this->state << 13;
+        this->state ^= this->state >> 17;
+        this->state ^= this->state << 5;
+        return this->state;
+    }
+    // The modulo introduces a bias, but at the bounds we use (4 and 7 against 2^32)
+    // it is at most ~1.6e-9, which is far below anything a player could notice.
+    uint32_t nextBelow(const uint32_t bound) {
+        return this->next() % bound;
+    }
+};
+
 struct Piece {
 public:
     static constexpr size_t width = 4;

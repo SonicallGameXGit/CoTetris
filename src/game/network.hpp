@@ -1,72 +1,116 @@
 #pragma once
 #include <vector>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <SDL3_net/SDL_net.h>
 
 namespace Network {
     // ! Protocol version number. Increment this when making changes to the protocol that are not backwards compatible.
-    static const uint32_t PROTOCOL_VERSION = 2;
+    static const uint32_t PROTOCOL_VERSION = 3;
 }
 
+// GG, Claude Code! It completely makes sense.
 // Prefixes:
 //  - C = client -> server
 //  - S = server -> client
 //  - SC = server <-> client
+// The player's client owns the one simulation. The server hands it a seed, relays
+// its board to everyone else, and passes the builder's prefabs back to it; nothing
+// here asks the server to move a piece, because nothing waits on the answer.
 enum class PacketId : uint8_t {
-    SC_Handshake, S_ClientTypeSet,
-    C_PieceMove, S_PiecePosition, SC_PieceRotate,
-    C_PrefabPush, S_PrefabPushSucceed,
-    S_Tick, C_TickDelta, C_TickRateChange,
-    S_SpawnPiece,
+    SC_Handshake, S_ClientTypeSet, S_GameStart,
+    SC_MapState,
+    SC_PrefabPush, C_PrefabPushResult, S_PrefabPushSucceed,
     Invalid = 255,
+};
+
+// Nice job, Claude Code!
+// Every packet is framed by an id and the length of the payload that follows it.
+// Without the length, a receiver that meets an id it does not know has no way to
+// tell where that packet ends, so it cannot skip it and the stream is desynchronised
+// from that point on. With it, an unknown packet costs nothing but a log line.
+struct PacketPrefix {
+    // 1 byte of id, then 2 bytes of little-endian payload length.
+    static constexpr size_t size = 3;
+    // The largest payload we send is a full board (a few hundred bytes), so 16 bits
+    // of length is far more headroom than the protocol will ever need.
+    static constexpr size_t maxPayloadLength = 0xFFFF;
+
+    PacketId id;
+    uint16_t length;
 };
 
 struct PacketReceiver {
 private:
     NET_StreamSocket *socket;
-    std::optional<PacketId> packetId;
     std::vector<uint8_t> buffer;
+    std::optional<PacketPrefix> prefix;
     size_t pointer;
+    // Set when a handler asks for more bytes than the packet said it carries, which
+    // means the packet is malformed. It is dropped whole rather than left at the
+    // head of the stream, where it would block every packet behind it forever.
+    bool malformed;
     bool own;
 public:
-    PacketReceiver(NET_StreamSocket *socket, bool own) : socket(socket), packetId(std::nullopt), buffer(), pointer(0), own(own) {}
+    PacketReceiver(NET_StreamSocket *socket, bool own) : socket(socket), buffer(), prefix(std::nullopt), pointer(0), malformed(false), own(own) {}
     ~PacketReceiver() {
         if (this->own) {
             NET_DestroyStreamSocket(this->socket);
         }
     }
 
+    // The buffer always begins at a packet prefix, so incoming bytes are simply
+    // appended; no part of the stream needs special treatment any more.
     void receive(const uint8_t *data, size_t length) {
-        if (!this->packetId.has_value()) {
-            this->packetId.emplace(static_cast<PacketId>(data[0]));
-            this->buffer.insert(this->buffer.end(), data + 1, data + length);
-        } else {
-            this->buffer.insert(this->buffer.end(), data, data + length);
-        }
+        this->buffer.insert(this->buffer.end(), data, data + length);
     }
+    // Drops the packet at the head of the stream in its entirety, whether or not
+    // the handler read all of it. This is what makes an unhandled or partially
+    // read packet harmless instead of stream-corrupting.
     void flush() {
-        if (this->buffer.size() > this->pointer) {
-            this->packetId = std::optional<PacketId>(static_cast<PacketId>(this->buffer[this->pointer]));
-            this->pointer++;
-        } else {
-            this->packetId = std::nullopt;
-        }
-        this->buffer.erase(this->buffer.begin(), this->buffer.begin() + this->pointer);
+        if (!this->prefix.has_value()) { return; }
+        const size_t total = PacketPrefix::size + static_cast<size_t>(this->prefix->length);
+        this->buffer.erase(this->buffer.begin(), this->buffer.begin() + total);
+        this->prefix = std::nullopt;
         this->pointer = 0;
+        this->malformed = false;
     }
     void rewind() {
         this->pointer = 0;
     }
 
     const std::optional<std::vector<uint8_t>::const_iterator> read(const size_t length) {
-        if (this->buffer.size() < this->pointer + length) { return std::nullopt; }
-        const std::vector<uint8_t>::const_iterator it = this->buffer.begin() + this->pointer;
+        if (!this->prefix.has_value()) { return std::nullopt; }
+        // Reads are bounded by the declared payload, so a short or hostile packet
+        // can never read its way into the bytes of the packet behind it.
+        if (this->pointer + length > static_cast<size_t>(this->prefix->length)) {
+            this->malformed = true;
+            return std::nullopt;
+        }
+        const std::vector<uint8_t>::const_iterator it = this->buffer.begin() + PacketPrefix::size + this->pointer;
         this->pointer += length;
         return it;
     }
 
-    std::optional<PacketId> getPacketId() { return this->packetId; }
+    // Reports the packet at the head of the stream only once every one of its bytes
+    // has arrived, so a handler never has to cope with a half-delivered packet.
+    std::optional<PacketId> getPacketId() {
+        if (this->malformed) { this->flush(); }
+        if (!this->prefix.has_value()) {
+            if (this->buffer.size() < PacketPrefix::size) { return std::nullopt; }
+            PacketPrefix decoded;
+            decoded.id = static_cast<PacketId>(this->buffer[0]);
+            decoded.length = static_cast<uint16_t>(
+                static_cast<uint16_t>(this->buffer[1]) |
+                (static_cast<uint16_t>(this->buffer[2]) << 8)
+            );
+            this->prefix = decoded;
+        }
+        if (this->buffer.size() < PacketPrefix::size + static_cast<size_t>(this->prefix->length)) { return std::nullopt; }
+        return this->prefix->id;
+    }
+    uint16_t getPacketLength() const { return this->prefix.has_value() ? this->prefix->length : 0; }
     NET_StreamSocket *getSocket() const { return this->socket; }
 };
 struct PacketSender {
@@ -74,13 +118,26 @@ private:
     std::vector<uint8_t> buffer;
 public:
     PacketSender(const PacketId packetId, const std::vector<uint8_t> &data) : buffer() {
-        buffer.reserve(1 + data.size());
+        buffer.reserve(PacketPrefix::size + data.size());
         buffer.push_back(static_cast<uint8_t>(packetId));
+        // Placeholder for the payload length. The caller appends the payload after
+        // construction via getMutableBuffer(), so the real value is only known by
+        // the time send() runs.
+        buffer.push_back(0);
+        buffer.push_back(0);
         buffer.insert(buffer.end(), data.begin(), data.end());
     }
     virtual ~PacketSender() = default;
 
     void send(NET_StreamSocket *socket) {
+        const size_t payloadLength = this->buffer.size() - PacketPrefix::size;
+        if (payloadLength > PacketPrefix::maxPayloadLength) {
+            fprintf(stderr, "Refusing to send a %zu byte payload for packet %d: the length prefix only holds %zu.\n",
+                payloadLength, static_cast<int>(this->buffer[0]), PacketPrefix::maxPayloadLength);
+            return;
+        }
+        this->buffer[1] = static_cast<uint8_t>(payloadLength & 0xFF);
+        this->buffer[2] = static_cast<uint8_t>((payloadLength >> 8) & 0xFF);
         NET_WriteToStreamSocket(socket, this->buffer.data(), this->buffer.size());
     }
     std::vector<uint8_t> &getMutableBuffer() { return this->buffer; }
@@ -91,15 +148,15 @@ protected:
     static void pushUInt8(std::vector<uint8_t> &buffer, const uint8_t value) {
         buffer.push_back(value);
     }
+    static void pushInt16(std::vector<uint8_t> &buffer, const int16_t value) {
+        buffer.push_back(static_cast<uint8_t>(value & 0xFF));
+        buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    }
     static void pushUInt32(std::vector<uint8_t> &buffer, const uint32_t value) {
         buffer.push_back(static_cast<uint8_t>(value & 0xFF));
         buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
         buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
         buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
-    }
-    static void pushInt16(std::vector<uint8_t> &buffer, const int16_t value) {
-        buffer.push_back(static_cast<uint8_t>(value & 0xFF));
-        buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
     }
     static uint8_t parseUInt8(std::vector<uint8_t>::const_iterator &it) {
         const uint8_t value = *it;
@@ -132,9 +189,9 @@ public:
     virtual bool parse(PacketReceiver &client) = 0;
 };
 
-struct HandshakePacket : public AbstractPacket {
-    uint32_t protocolVersion;
+class HandshakePacket : public AbstractPacket {
 public:
+    uint32_t protocolVersion;
     HandshakePacket() : AbstractPacket(), protocolVersion(Network::PROTOCOL_VERSION) {}
     virtual ~HandshakePacket() = default;
     
@@ -152,7 +209,7 @@ public:
 enum class ClientType : uint8_t {
     Player = 0, Builder = 1, Spectator = 2, Invalid = 255
 };
-struct ClientTypeSetPacket : public AbstractPacket {
+class ClientTypeSetPacket : public AbstractPacket {
 public:
     ClientType type;
     ClientTypeSetPacket() : AbstractPacket(), type(ClientType::Invalid) {}
@@ -169,64 +226,10 @@ public:
         return true;
     }
 };
-struct PieceMovePacket : public AbstractPacket {
-public:
-    enum class Direction : uint8_t {
-        Left = 0,
-        Right = 1
-    };
-    Direction direction;
-
-    PieceMovePacket() : AbstractPacket(), direction(Direction::Left) {}
-    virtual ~PieceMovePacket() = default;
-
-    virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushUInt8(buffer, static_cast<uint8_t>(this->direction));
-    }
-    virtual bool parse(PacketReceiver &client) override {
-        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(1);
-        if (!reserveTry.has_value()) { return false; }
-        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-
-        this->direction = static_cast<Direction>(AbstractPacket::parseUInt8(reserve));
-        return true;
-    }
-};
-struct PiecePositionPacket : public AbstractPacket {
-public:
-    int16_t x;
-    PiecePositionPacket() : AbstractPacket(), x(0) {}
-    virtual ~PiecePositionPacket() = default;
-
-    virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushInt16(buffer, this->x);
-    }
-    virtual bool parse(PacketReceiver &client) override {
-        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(2);
-        if (!reserveTry.has_value()) { return false; }
-        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-        this->x = AbstractPacket::parseInt16(reserve);
-        return true;
-    }
-};
-struct PieceRotatePacket : public AbstractPacket {
-public:
-    uint8_t orientation;
-    PieceRotatePacket() : AbstractPacket(), orientation(0) {}
-    virtual ~PieceRotatePacket() = default;
-
-    virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushUInt8(buffer, this->orientation);
-    }
-    virtual bool parse(PacketReceiver &client) override {
-        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(1);
-        if (!reserveTry.has_value()) { return false; }
-        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-        this->orientation = AbstractPacket::parseUInt8(reserve);
-        return true;
-    }
-};
-struct PrefabPushPacket : public AbstractPacket {
+// A prefab travelling under SC_PrefabPush in both directions: the builder offers
+// one to the server, and the server relays it unchanged to the player's client,
+// which owns the prefab stack and decides whether it fits.
+class PrefabPushPacket : public AbstractPacket {
 public:
     std::array<std::array<uint8_t, Piece::width>, Piece::height> prefab;
     PrefabPushPacket() : AbstractPacket(), prefab() {}
@@ -251,7 +254,7 @@ public:
         return true;
     }
 };
-struct PrefabPushSucceedPacket : public AbstractPacket {
+class PrefabPushSucceedPacket : public AbstractPacket {
 public:
     PrefabPushSucceedPacket() : AbstractPacket() {}
     virtual ~PrefabPushSucceedPacket() = default;
@@ -259,12 +262,16 @@ public:
     virtual void build(std::vector<uint8_t> &buffer) const override {}
     virtual bool parse(PacketReceiver &client) override { return true; }
 };
-struct TickPacket : public AbstractPacket {
+// A complete snapshot of the playfield, travelling under SC_MapState in both
+// directions: the player's client sends it whenever its simulation changes, and
+// the server relays it unchanged to the builder and any spectators. The receiver
+// always knows which way it came from, so one id is enough.
+class MapStatePacket : public AbstractPacket {
 public:
     std::array<std::array<uint8_t, Map::width>, Map::height> grid;
     std::optional<Piece> piece;
-    TickPacket() : AbstractPacket(), grid(), piece(std::nullopt) {}
-    virtual ~TickPacket() = default;
+    MapStatePacket() : AbstractPacket(), grid(), piece(std::nullopt) {}
+    virtual ~MapStatePacket() = default;
 
     virtual void build(std::vector<uint8_t> &buffer) const override {
         for (const std::array<uint8_t, Map::width> &row : this->grid) {
@@ -314,75 +321,44 @@ public:
         return true;
     }
 };
-struct TickDeltaPacket : public AbstractPacket {
+// Hands the player's client the seed for the piece sequence, so it can spawn
+// pieces itself instead of waiting a round trip for the server to name each one.
+// The server keeps the seed too, which is what makes the sequence reproducible
+// if it ever needs to check the player's work.
+class GameStartPacket : public AbstractPacket {
 public:
-    int16_t x, y;
-    uint8_t orientation;
-    TickDeltaPacket() : AbstractPacket(), x(0), y(0), orientation(0) {}
-    virtual ~TickDeltaPacket() = default;
+    uint32_t seed;
+    GameStartPacket() : AbstractPacket(), seed(0) {}
+    virtual ~GameStartPacket() = default;
 
     virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushInt16(buffer, this->x);
-        AbstractPacket::pushInt16(buffer, this->y);
-        AbstractPacket::pushUInt8(buffer, this->orientation);
+        AbstractPacket::pushUInt32(buffer, this->seed);
     }
     virtual bool parse(PacketReceiver &client) override {
-        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(5);
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(4);
         if (!reserveTry.has_value()) { return false; }
         std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-        this->x = AbstractPacket::parseInt16(reserve);
-        this->y = AbstractPacket::parseInt16(reserve);
-        this->orientation = AbstractPacket::parseUInt8(reserve);
+        this->seed = AbstractPacket::parseUInt32(reserve);
         return true;
     }
 };
-struct TickRateChangePacket : public AbstractPacket {
+// The player's client owns the prefab stack, so only it can say whether a push
+// fit. This carries that answer back to the server, which forwards it to the
+// builder as S_PrefabPushSucceed.
+class PrefabPushResultPacket : public AbstractPacket {
 public:
-    bool fast;
-    TickRateChangePacket() : AbstractPacket(), fast(false) {}
-    virtual ~TickRateChangePacket() = default;
+    bool accepted;
+    PrefabPushResultPacket() : AbstractPacket(), accepted(false) {}
+    virtual ~PrefabPushResultPacket() = default;
 
     virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushUInt8(buffer, this->fast ? 1 : 0);
+        AbstractPacket::pushUInt8(buffer, this->accepted ? 1 : 0);
     }
     virtual bool parse(PacketReceiver &client) override {
         const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(1);
         if (!reserveTry.has_value()) { return false; }
         std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-        this->fast = AbstractPacket::parseUInt8(reserve) != 0;
-        return true;
-    }
-};
-struct SpawnPiecePacket : public AbstractPacket {
-public:
-    Piece piece;
-    SpawnPiecePacket() : AbstractPacket(), piece(0, 0, 0) {}
-    virtual ~SpawnPiecePacket() = default;
-    
-    virtual void build(std::vector<uint8_t> &buffer) const override {
-        AbstractPacket::pushInt16(buffer, this->piece.x);
-        AbstractPacket::pushInt16(buffer, this->piece.y);
-        AbstractPacket::pushUInt8(buffer, this->piece.orientation);
-        for (size_t row = 0; row < Piece::height; row++) {
-            for (size_t col = 0; col < Piece::width; col++) {
-                AbstractPacket::pushUInt8(buffer, this->piece.getPrefabCell(row, col));
-            }
-        }
-    }
-    virtual bool parse(PacketReceiver &client) override {
-        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(5 + Piece::width * Piece::height);
-        if (!reserveTry.has_value()) { return false; }
-        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
-        this->piece.x = AbstractPacket::parseInt16(reserve);
-        this->piece.y = AbstractPacket::parseInt16(reserve);
-        this->piece.orientation = AbstractPacket::parseUInt8(reserve);
-        std::array<std::array<uint8_t, Piece::width>, Piece::height> tempPrefab = std::array<std::array<uint8_t, Piece::width>, Piece::height>();
-        for (size_t row = 0; row < Piece::height; row++) {
-            for (size_t col = 0; col < Piece::width; col++) {
-                tempPrefab[row][col] = AbstractPacket::parseUInt8(reserve);
-            }
-        }
-        this->piece.copy(tempPrefab);
+        this->accepted = AbstractPacket::parseUInt8(reserve) != 0;
         return true;
     }
 };
