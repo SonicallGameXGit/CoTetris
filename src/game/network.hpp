@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <vector>
 #include <cstdint>
 #include <cstdio>
@@ -7,7 +8,12 @@
 
 namespace Network {
     // ! Protocol version number. Increment this when making changes to the protocol that are not backwards compatible.
-    static const uint32_t PROTOCOL_VERSION = 3;
+    static const uint32_t PROTOCOL_VERSION = 4;
+    // Room codes are fixed-length so both sides can frame them without a length
+    // prefix of their own. The relay generates them from an unambiguous alphabet
+    // (no 0/O, 1/I, etc), since a human has to read one off a friend out loud.
+    static constexpr size_t ROOM_CODE_LENGTH = 5;
+    using RoomCode = std::array<char, ROOM_CODE_LENGTH>;
 }
 
 // GG, Claude Code! It completely makes sense.
@@ -19,7 +25,13 @@ namespace Network {
 // its board to everyone else, and passes the builder's prefabs back to it; nothing
 // here asks the server to move a piece, because nothing waits on the answer.
 enum class PacketId : uint8_t {
-    SC_Handshake, S_ClientTypeSet, S_GameStart,
+    SC_Handshake,
+    // Sent right after the handshake, before any role is assigned: the relay
+    // hosts many concurrent rooms, so a connection has to say which one it
+    // belongs to before it can be told whether it's the player, the builder,
+    // or a spectator.
+    C_CreateRoom, S_RoomCreated, C_JoinRoom, S_RoomJoinResult,
+    S_ClientTypeSet, S_GameStart,
     SC_MapState,
     SC_PrefabPush, C_PrefabPushResult, S_PrefabPushSucceed,
     Invalid = 255,
@@ -203,6 +215,81 @@ public:
         if (!reserveTry.has_value()) { return false; }
         std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
         this->protocolVersion = AbstractPacket::parseUInt32(reserve);
+        return true;
+    }
+};
+// Sent right after the handshake, before any role is assigned: it asks the
+// relay to allocate a fresh room and make this connection its first member.
+class CreateRoomPacket : public AbstractPacket {
+public:
+    CreateRoomPacket() : AbstractPacket() {}
+    virtual ~CreateRoomPacket() = default;
+
+    virtual void build(std::vector<uint8_t> &buffer) const override {}
+    virtual bool parse(PacketReceiver &client) override { return true; }
+};
+// Answers C_CreateRoom with the code the relay generated, so the creator has
+// something to hand to whoever it wants to play with.
+class RoomCreatedPacket : public AbstractPacket {
+public:
+    Network::RoomCode code;
+    RoomCreatedPacket() : AbstractPacket(), code() {}
+    virtual ~RoomCreatedPacket() = default;
+
+    virtual void build(std::vector<uint8_t> &buffer) const override {
+        for (const char c : this->code) {
+            AbstractPacket::pushUInt8(buffer, static_cast<uint8_t>(c));
+        }
+    }
+    virtual bool parse(PacketReceiver &client) override {
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(Network::ROOM_CODE_LENGTH);
+        if (!reserveTry.has_value()) { return false; }
+        std::vector<uint8_t>::const_iterator it = reserveTry.value();
+        for (char &c : this->code) {
+            c = static_cast<char>(AbstractPacket::parseUInt8(it));
+        }
+        return true;
+    }
+};
+// Sent right after the handshake, in place of C_CreateRoom, when this
+// connection wants to join a room somebody else already created.
+class JoinRoomPacket : public AbstractPacket {
+public:
+    Network::RoomCode code;
+    JoinRoomPacket() : AbstractPacket(), code() {}
+    virtual ~JoinRoomPacket() = default;
+
+    virtual void build(std::vector<uint8_t> &buffer) const override {
+        for (const char c : this->code) {
+            AbstractPacket::pushUInt8(buffer, static_cast<uint8_t>(c));
+        }
+    }
+    virtual bool parse(PacketReceiver &client) override {
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(Network::ROOM_CODE_LENGTH);
+        if (!reserveTry.has_value()) { return false; }
+        std::vector<uint8_t>::const_iterator it = reserveTry.value();
+        for (char &c : this->code) {
+            c = static_cast<char>(AbstractPacket::parseUInt8(it));
+        }
+        return true;
+    }
+};
+// Answers C_JoinRoom. A failure means the code did not match any room
+// currently open on the relay (typo'd, or the room has already ended).
+class RoomJoinResultPacket : public AbstractPacket {
+public:
+    bool success;
+    RoomJoinResultPacket() : AbstractPacket(), success(false) {}
+    virtual ~RoomJoinResultPacket() = default;
+
+    virtual void build(std::vector<uint8_t> &buffer) const override {
+        AbstractPacket::pushUInt8(buffer, this->success ? 1 : 0);
+    }
+    virtual bool parse(PacketReceiver &client) override {
+        const std::optional<std::vector<uint8_t>::const_iterator> reserveTry = client.read(1);
+        if (!reserveTry.has_value()) { return false; }
+        std::vector<uint8_t>::const_iterator reserve = reserveTry.value();
+        this->success = AbstractPacket::parseUInt8(reserve) != 0;
         return true;
     }
 };

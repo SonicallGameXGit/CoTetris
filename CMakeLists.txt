@@ -20,6 +20,7 @@ add_subdirectory(libs/GLM)
 # add_subdirectory(libs/FreeType)
 
 add_executable(${PROJECT_NAME}
+    src/tinyfiledialogs/tinyfiledialogs.c
     src/main.cpp
     src/core/sdl.cpp
     src/core/gl.cpp
@@ -35,6 +36,12 @@ target_link_libraries(${PROJECT_NAME}
         # freetype
 )
 
+if (WIN32)
+    # tinyfiledialogs' native Windows dialogs go through COM (CoCreateInstance)
+    # and the legacy comdlg32 file-dialog API, neither of which MSVC links by default.
+    target_link_libraries(${PROJECT_NAME} PRIVATE comdlg32 ole32 uuid)
+endif()
+
 target_include_directories(${PROJECT_NAME}
     PRIVATE
         libs/SDL/include
@@ -42,5 +49,6 @@ target_include_directories(${PROJECT_NAME}
         libs/SDL_net/include
         libs/GLAD/include
         libs/GLM
+        src/tinyfiledialogs
         # libs/FreeType/include
 )

@@ -1,9 +1,21 @@
+#include <cctype>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include "core/sdl.hpp"
 #include "core/gl.hpp"
 #include "game/piece.hpp"
 #include "game/map.hpp"
 #include "game/button.hpp"
 #include "game/network.hpp"
+#include "tinyfiledialogs/tinyfiledialogs.h"
+
+namespace RelayConfig {
+    // TODO: point this at the VPS's public IP/hostname once the relay is deployed.
+    // 127.0.0.1 only works for testing two instances against each other on one machine.
+    static constexpr const char *HOST = "173.242.54.254";
+    static constexpr Uint16 PORT = 25565;
+}
 
 float pixelToWorldX(const float x, const float windowWidth, const float windowHeight) {
     return (x / windowWidth * 2.0f - 1.0f) * (windowWidth / windowHeight);
@@ -15,6 +27,29 @@ float pixelToWorldY(const float y, const float windowHeight) {
 namespace GameProperties {
     static constexpr float SLOW_TICK_RATE = 1.0f / 2.0f;
     static constexpr float FAST_TICK_RATE = 1.0f / 12.0f;
+}
+
+// Blocks until the relay sends the packet id we're waiting for. This only runs
+// before the game window and its per-frame socket polling exist, for the
+// handful of request/response exchanges (handshake ack, room create/join) that
+// have to resolve before there's anything to show on screen.
+bool waitForPacket(PacketReceiver &connection, PacketId expected) {
+    while (true) {
+        uint8_t buffer[4096];
+        const int bytesRead = NET_ReadFromStreamSocket(connection.getSocket(), buffer, sizeof(buffer));
+        if (bytesRead < 0) { return false; }
+        if (bytesRead > 0) {
+            connection.receive(buffer, static_cast<size_t>(bytesRead));
+            const std::optional<PacketId> packetId = connection.getPacketId();
+            if (packetId.has_value()) {
+                if (packetId.value() == expected) { return true; }
+                // Not what this wait is for; drop it and keep listening. Nothing
+                // else should arrive this early, but skipping is free either way.
+                connection.flush();
+            }
+        }
+        SDL_Delay(10);
+    }
 }
 
 int client(const char *ip, Uint16 port) {
@@ -50,6 +85,92 @@ int client(const char *ip, Uint16 port) {
         sender.send(client.getSocket());
     }
 
+    // The relay has to confirm the handshake, and then a room, before there is
+    // anything worth putting a game window on screen for. Both are resolved
+    // through native popups so this works with no in-game text rendering.
+    if (!waitForPacket(client, PacketId::SC_Handshake)) {
+        tinyfd_messageBox("CoTetris", "Lost connection to the relay while handshaking.", "ok", "error", 1);
+        return 1;
+    }
+    {
+        HandshakePacket ack = HandshakePacket();
+        ack.parse(client);
+        client.flush();
+        if (ack.protocolVersion != Network::PROTOCOL_VERSION) {
+            tinyfd_messageBox("CoTetris", "This build is out of date with the relay server. Please update the game.", "ok", "error", 1);
+            return 1;
+        }
+    }
+
+    // Loops back to the New/Join choice whenever the player cancels out of
+    // something that choice led to (e.g. the room code entry), since that
+    // screen is this one's parent. Cancelling the choice itself has no parent
+    // to fall back to, so that is the only case that quits outright.
+    while (true) {
+        const int roomChoice = tinyfd_messageBox("CoTetris", "Create a new room, or join one a friend already started?\n\nYes = New Room\nNo = Join Room", "yesnocancel", "question", 1);
+        if (roomChoice == 0) { return 0; }
+
+        if (roomChoice == 1) {
+            CreateRoomPacket packet = CreateRoomPacket();
+            PacketSender sender = PacketSender(PacketId::C_CreateRoom, std::vector<uint8_t>());
+            packet.build(sender.getMutableBuffer());
+            sender.send(client.getSocket());
+
+            if (!waitForPacket(client, PacketId::S_RoomCreated)) {
+                tinyfd_messageBox("CoTetris", "Lost connection to the relay while creating a room.", "ok", "error", 1);
+                return 1;
+            }
+            RoomCreatedPacket created = RoomCreatedPacket();
+            created.parse(client);
+            client.flush();
+
+            const std::string code(created.code.begin(), created.code.end());
+            SDL_SetClipboardText(code.c_str());
+            // No apostrophes or quotes here: tinyfiledialogs refuses to show a
+            // message containing one, since it cannot safely escape it for
+            // every backend it shells out to.
+            const std::string message = "Room created! Code: " + code + "\n\nIt has been copied to your clipboard - send it to whoever you want to play with.";
+            tinyfd_messageBox("CoTetris", message.c_str(), "ok", "info", 1);
+            break;
+        }
+
+        // Join Room. Cancelling the code prompt falls through to the bottom of
+        // this loop, which re-shows the New/Join choice instead of quitting.
+        bool joined = false;
+        while (true) {
+            char *input = tinyfd_inputBox("CoTetris", "Enter the room code your friend sent you:", "");
+            if (input == nullptr) { break; }
+
+            std::string code(input);
+            for (char &c : code) { c = static_cast<char>(toupper(static_cast<unsigned char>(c))); }
+            if (code.length() != Network::ROOM_CODE_LENGTH) {
+                tinyfd_messageBox("CoTetris", "That code does not look right - codes are 5 characters.", "ok", "warning", 1);
+                continue;
+            }
+
+            JoinRoomPacket packet = JoinRoomPacket();
+            std::copy(code.begin(), code.end(), packet.code.begin());
+            PacketSender sender = PacketSender(PacketId::C_JoinRoom, std::vector<uint8_t>());
+            packet.build(sender.getMutableBuffer());
+            sender.send(client.getSocket());
+
+            if (!waitForPacket(client, PacketId::S_RoomJoinResult)) {
+                tinyfd_messageBox("CoTetris", "Lost connection to the relay while joining.", "ok", "error", 1);
+                return 1;
+            }
+            RoomJoinResultPacket result = RoomJoinResultPacket();
+            result.parse(client);
+            client.flush();
+
+            if (!result.success) {
+                tinyfd_messageBox("CoTetris", "No room found with that code. Double check it and try again.", "ok", "warning", 1);
+                continue;
+            }
+            joined = true;
+            break;
+        }
+        if (joined) { break; }
+    }
 
     float windowWidth = 1280, windowHeight = 720;
     const sdl::Window window = sdl::Window("CoTetris", static_cast<int>(windowWidth), static_cast<int>(windowHeight), SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
@@ -77,7 +198,7 @@ int client(const char *ip, Uint16 port) {
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+    glClearColor(9.0f / 255.0f, 15.0f / 255.0f, 37.0f / 255.0f, 1.0f);
 
     uint8_t mouseButtonsBitmask = 0;
     glm::vec2 mousePosition = glm::vec2();
@@ -479,6 +600,36 @@ int client(const char *ip, Uint16 port) {
     }
     return 0;
 }
+// One relay process hosts many concurrent games, so what used to be the
+// server's global state (one player, one builder, one cached board) now
+// belongs to a Room instead. PacketReceivers are still owned by the
+// connection list in server(); a Room only holds raw pointers to whichever
+// of them have joined it.
+struct Room {
+    std::vector<PacketReceiver*> clients = std::vector<PacketReceiver*>();
+    PacketReceiver *player = nullptr;
+    PacketReceiver *builder = nullptr;
+    std::optional<MapStatePacket> lastPlayerState = std::nullopt;
+    bool gameStarted = false;
+    std::string lastValidationWarning;
+};
+
+// Excludes 0/O, 1/I/L and other easily-confused characters, since a player
+// reads this code off a friend over voice chat rather than copy-pasting it.
+static constexpr char roomCodeAlphabet[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+static constexpr size_t roomCodeAlphabetSize = sizeof(roomCodeAlphabet) - 1;
+
+std::string generateRoomCode(Random &rng, const std::unordered_map<std::string, Room> &rooms) {
+    std::string code;
+    do {
+        code.clear();
+        for (size_t i = 0; i < Network::ROOM_CODE_LENGTH; i++) {
+            code.push_back(roomCodeAlphabet[rng.nextBelow(roomCodeAlphabetSize)]);
+        }
+    } while (rooms.find(code) != rooms.end());
+    return code;
+}
+
 int server(const char *ip, Uint16 port) {
     // An empty address (or one of the "any" spellings) means "listen on every
     // interface", which SDL_net expresses by passing a null address. That is
@@ -508,22 +659,33 @@ int server(const char *ip, Uint16 port) {
     }
     printf("Server started on port %d.\n", port);
 
-    // ! The server does not simulate. The player's client owns the one and only
-    // ! simulation, and everything here is either a relay or a cache of what the
-    // ! player last reported, so that late joiners have something to draw.
-    std::optional<MapStatePacket> lastPlayerState = std::nullopt;
-    bool gameStarted = false;
+    // ! The server does not simulate. Each room's player client owns that room's
+    // ! one and only simulation, and everything here is either a relay or a cache
+    // ! of what the player last reported, so that late joiners have something to
+    // ! draw. Rooms are created and looked up by their code; a client is not in
+    // ! any room until it sends C_CreateRoom or C_JoinRoom.
+    std::unordered_map<std::string, Room> rooms;
+    std::unordered_map<PacketReceiver*, std::string> clientRoomCode;
+    // ! A version mismatch is only ever logged, never disconnected outright, but a
+    // ! mismatched client must still be kept out of a room: it may not agree with
+    // ! this build on packet shapes, and letting it in could desync a real player.
+    std::unordered_set<PacketReceiver*> incompatibleClients;
     Random serverRandom = Random(static_cast<uint32_t>(SDL_GetTicksNS()));
 
     std::vector<std::unique_ptr<PacketReceiver>> clients = std::vector<std::unique_ptr<PacketReceiver>>();
-    PacketReceiver *player = nullptr, *builder = nullptr;
+
+    std::function<Room*(PacketReceiver*)> findRoom = [&](PacketReceiver *client) -> Room* {
+        const std::unordered_map<PacketReceiver*, std::string>::iterator codeIt = clientRoomCode.find(client);
+        if (codeIt == clientRoomCode.end()) { return nullptr; }
+        const std::unordered_map<std::string, Room>::iterator roomIt = rooms.find(codeIt->second);
+        return roomIt == rooms.end() ? nullptr : &roomIt->second;
+    };
 
     // ! This is bug containment, not anti-cheat. A co-op game has nobody to cheat
     // ! against, and correcting the player is exactly the behaviour that made the
     // ! game feel bad in the first place, so a failed check is only ever reported.
-    // ! Compares against lastPlayerState, so it must run before that is replaced.
-    std::string lastValidationWarning;
-    std::function<void(const MapStatePacket &)> validatePlayerState = [&](const MapStatePacket &state) {
+    // ! Compares against room.lastPlayerState, so it must run before that is replaced.
+    std::function<void(Room &, const MapStatePacket &)> validatePlayerState = [&](Room &room, const MapStatePacket &state) {
         char warning[256];
         warning[0] = '\0';
 
@@ -550,9 +712,9 @@ int server(const char *ip, Uint16 port) {
             }
         }
 
-        if (warning[0] == '\0' && lastPlayerState.has_value()) {
+        if (warning[0] == '\0' && room.lastPlayerState.has_value()) {
             size_t previousFilled = 0;
-            for (const std::array<uint8_t, Map::width> &row : lastPlayerState->grid) {
+            for (const std::array<uint8_t, Map::width> &row : room.lastPlayerState->grid) {
                 for (const uint8_t cell : row) {
                     if (cell != 0) { previousFilled++; }
                 }
@@ -569,12 +731,12 @@ int server(const char *ip, Uint16 port) {
         // A state update arrives up to sixty times a second, so repeating an unchanged
         // complaint would bury every other message. Each distinct one is said once.
         if (warning[0] != '\0') {
-            if (lastValidationWarning != warning) {
-                lastValidationWarning = warning;
+            if (room.lastValidationWarning != warning) {
+                room.lastValidationWarning = warning;
                 printf("[validation] %s\n", warning);
             }
         } else {
-            lastValidationWarning.clear();
+            room.lastValidationWarning.clear();
         }
     };
 
@@ -585,7 +747,7 @@ int server(const char *ip, Uint16 port) {
             case PacketId::SC_Handshake: {
                 HandshakePacket packet = HandshakePacket();
                 if (!packet.parse(client)) { return false; }
-                if (&client == player || &client == builder) { break; }
+                if (clientRoomCode.find(&client) != clientRoomCode.end()) { break; }
 
                 const uint32_t clientProtocolVersion = packet.protocolVersion;
                 packet.protocolVersion = Network::PROTOCOL_VERSION;
@@ -597,66 +759,118 @@ int server(const char *ip, Uint16 port) {
 
                 if (clientProtocolVersion != Network::PROTOCOL_VERSION) {
                     printf("Client has incompatible protocol version %d, expected %d.\n", clientProtocolVersion, Network::PROTOCOL_VERSION);
+                    incompatibleClients.insert(&client);
                 } else {
                     printf("Client has compatible protocol version %d.\n", clientProtocolVersion);
+                }
+                break;
+            }
+            case PacketId::C_CreateRoom: {
+                CreateRoomPacket packet = CreateRoomPacket();
+                if (!packet.parse(client)) { return false; }
+                if (clientRoomCode.find(&client) != clientRoomCode.end() || incompatibleClients.count(&client) > 0) { break; }
+
+                const std::string code = generateRoomCode(serverRandom, rooms);
+                Room &room = rooms[code];
+                room.clients.push_back(&client);
+                room.player = &client;
+                clientRoomCode[&client] = code;
+                printf("Room %s created.\n", code.c_str());
+
+                {
+                    RoomCreatedPacket responsePacket = RoomCreatedPacket();
+                    std::copy(code.begin(), code.end(), responsePacket.code.begin());
+                    PacketSender sender = PacketSender(PacketId::S_RoomCreated, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
+                {
                     ClientTypeSetPacket responsePacket = ClientTypeSetPacket();
-                    if (player == nullptr) {
-                        player = &client;
-                        responsePacket.type = ClientType::Player;
-                    } else if (builder == nullptr) {
-                        builder = &client;
-                        responsePacket.type = ClientType::Builder;
-                    } else {
-                        responsePacket.type = ClientType::Spectator;
-                    }
-                    {
-                        PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
-                        responsePacket.build(sender.getMutableBuffer());
-                        sender.send(client.getSocket());
-                    }
+                    responsePacket.type = ClientType::Player;
+                    PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
+                break;
+            }
+            case PacketId::C_JoinRoom: {
+                JoinRoomPacket packet = JoinRoomPacket();
+                if (!packet.parse(client)) { return false; }
+                if (clientRoomCode.find(&client) != clientRoomCode.end() || incompatibleClients.count(&client) > 0) { break; }
 
-                    // Anyone who is not the player only ever watches, so hand a
-                    // newcomer the last known board immediately instead of leaving
-                    // it staring at an empty field until the player next moves.
-                    if (&client != player && lastPlayerState.has_value()) {
-                        PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
-                        lastPlayerState->build(sender.getMutableBuffer());
-                        sender.send(client.getSocket());
-                    }
+                const std::string code(packet.code.begin(), packet.code.end());
+                const std::unordered_map<std::string, Room>::iterator roomIt = rooms.find(code);
+                const bool found = roomIt != rooms.end();
+                {
+                    RoomJoinResultPacket responsePacket = RoomJoinResultPacket();
+                    responsePacket.success = found;
+                    PacketSender sender = PacketSender(PacketId::S_RoomJoinResult, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
+                if (!found) { break; }
 
-                    // The game exists only while somebody is simulating it, so it
-                    // begins as soon as there is both a player to run it and a
-                    // builder to feed it. The seed is all the player needs to
-                    // produce the whole piece sequence on its own.
-                    if (player != nullptr && builder != nullptr && !gameStarted) {
-                        gameStarted = true;
-                        lastPlayerState.reset();
+                Room &room = roomIt->second;
+                room.clients.push_back(&client);
+                clientRoomCode[&client] = code;
 
-                        GameStartPacket gameStartPacket = GameStartPacket();
-                        gameStartPacket.seed = serverRandom.next();
-                        PacketSender sender = PacketSender(PacketId::S_GameStart, std::vector<uint8_t>());
-                        gameStartPacket.build(sender.getMutableBuffer());
-                        sender.send(player->getSocket());
-                        printf("Game started with seed %u.\n", gameStartPacket.seed);
-                    }
+                ClientTypeSetPacket responsePacket = ClientTypeSetPacket();
+                if (room.player == nullptr) {
+                    room.player = &client;
+                    responsePacket.type = ClientType::Player;
+                } else if (room.builder == nullptr) {
+                    room.builder = &client;
+                    responsePacket.type = ClientType::Builder;
+                } else {
+                    responsePacket.type = ClientType::Spectator;
+                }
+                {
+                    PacketSender sender = PacketSender(PacketId::S_ClientTypeSet, std::vector<uint8_t>());
+                    responsePacket.build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
+
+                // Anyone who is not the player only ever watches, so hand a
+                // newcomer the last known board immediately instead of leaving
+                // it staring at an empty field until the player next moves.
+                if (&client != room.player && room.lastPlayerState.has_value()) {
+                    PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
+                    room.lastPlayerState->build(sender.getMutableBuffer());
+                    sender.send(client.getSocket());
+                }
+
+                // The game exists only while somebody is simulating it, so it
+                // begins as soon as there is both a player to run it and a
+                // builder to feed it. The seed is all the player needs to
+                // produce the whole piece sequence on its own.
+                if (room.player != nullptr && room.builder != nullptr && !room.gameStarted) {
+                    room.gameStarted = true;
+                    room.lastPlayerState.reset();
+
+                    GameStartPacket gameStartPacket = GameStartPacket();
+                    gameStartPacket.seed = serverRandom.next();
+                    PacketSender sender = PacketSender(PacketId::S_GameStart, std::vector<uint8_t>());
+                    gameStartPacket.build(sender.getMutableBuffer());
+                    sender.send(room.player->getSocket());
+                    printf("Room %s started with seed %u.\n", code.c_str(), gameStartPacket.seed);
                 }
                 break;
             }
             case PacketId::SC_MapState: {
                 MapStatePacket packet = MapStatePacket();
                 if (!packet.parse(client)) { return false; }
+                Room *room = findRoom(&client);
                 // ! Only the player simulates. Anyone else claiming to is ignored,
                 // ! which is what keeps a builder or spectator from driving the board.
-                if (&client != player) { break; }
+                if (room == nullptr || &client != room->player) { break; }
 
-                validatePlayerState(packet);
-                lastPlayerState = packet;
+                validatePlayerState(*room, packet);
+                room->lastPlayerState = packet;
 
                 PacketSender sender = PacketSender(PacketId::SC_MapState, std::vector<uint8_t>());
                 packet.build(sender.getMutableBuffer());
-                for (std::vector<std::unique_ptr<PacketReceiver>>::iterator it = clients.begin(); it != clients.end(); ++it) {
-                    PacketReceiver *otherClient = it->get();
-                    if (otherClient == player) { continue; }
+                for (PacketReceiver *otherClient : room->clients) {
+                    if (otherClient == room->player) { continue; }
                     sender.send(otherClient->getSocket());
                 }
                 break;
@@ -664,24 +878,26 @@ int server(const char *ip, Uint16 port) {
             case PacketId::SC_PrefabPush: {
                 PrefabPushPacket packet = PrefabPushPacket();
                 if (!packet.parse(client)) { return false; }
-                if (&client != builder || player == nullptr) { break; }
+                Room *room = findRoom(&client);
+                if (room == nullptr || &client != room->builder || room->player == nullptr) { break; }
 
                 // The server no longer owns the prefab stack, so it cannot say
                 // whether this fits. Hand it to the player and let it answer.
                 PacketSender sender = PacketSender(PacketId::SC_PrefabPush, std::vector<uint8_t>());
                 packet.build(sender.getMutableBuffer());
-                sender.send(player->getSocket());
+                sender.send(room->player->getSocket());
                 break;
             }
             case PacketId::C_PrefabPushResult: {
                 PrefabPushResultPacket packet = PrefabPushResultPacket();
                 if (!packet.parse(client)) { return false; }
-                if (&client != player || builder == nullptr || !packet.accepted) { break; }
+                Room *room = findRoom(&client);
+                if (room == nullptr || &client != room->player || room->builder == nullptr || !packet.accepted) { break; }
 
                 PrefabPushSucceedPacket responsePacket = PrefabPushSucceedPacket();
                 PacketSender sender = PacketSender(PacketId::S_PrefabPushSucceed, std::vector<uint8_t>());
                 responsePacket.build(sender.getMutableBuffer());
-                sender.send(builder->getSocket());
+                sender.send(room->builder->getSocket());
                 break;
             }
             default: {
@@ -711,22 +927,34 @@ int server(const char *ip, Uint16 port) {
 
             uint8_t buffer[4096];
             int bytesRead = NET_ReadFromStreamSocket(client.getSocket(), buffer, sizeof(buffer));
-            
+
             if (bytesRead < 0) {
                 printf("Client disconnected.\n");
-                if (&client == player) {
-                    // The player held the only simulation, so losing it ends the
-                    // game. Clearing the flag lets the next player to connect
-                    // start a fresh one with a new seed.
-                    player = nullptr;
-                    gameStarted = false;
-                } else if (&client == builder) {
-                    builder = nullptr;
+                const std::unordered_map<PacketReceiver*, std::string>::iterator codeIt = clientRoomCode.find(&client);
+                if (codeIt != clientRoomCode.end()) {
+                    const std::unordered_map<std::string, Room>::iterator roomIt = rooms.find(codeIt->second);
+                    if (roomIt != rooms.end()) {
+                        Room &room = roomIt->second;
+                        if (&client == room.player) {
+                            // The player held the only simulation, so losing it ends
+                            // the game. Clearing the pointer lets the next player to
+                            // join start a fresh one with a new seed.
+                            room.player = nullptr;
+                            room.gameStarted = false;
+                        } else if (&client == room.builder) {
+                            room.builder = nullptr;
+                        }
+                        room.clients.erase(std::remove(room.clients.begin(), room.clients.end(), &client), room.clients.end());
+                        // Nobody is left to relay to or cache state for, so the room
+                        // itself goes away and its code becomes free to reuse.
+                        if (room.clients.empty()) {
+                            rooms.erase(roomIt);
+                        }
+                    }
+                    clientRoomCode.erase(codeIt);
                 }
+                incompatibleClients.erase(&client);
                 it = clients.erase(it);
-                if (clients.empty()) {
-                    lastPlayerState = std::nullopt;
-                }
                 continue;
             } else if (bytesRead > 0) {
                 client.receive(buffer, static_cast<size_t>(bytesRead));
@@ -745,9 +973,29 @@ int server(const char *ip, Uint16 port) {
 }
 
 int main(int argc, char *argv[]) {
+    // No arguments is the normal way to play: connect straight to the relay and
+    // let the New Room/Join Room popups take it from there. The explicit
+    // server/client ip port form still exists underneath for manual testing
+    // (e.g. running the relay itself, or pointing a client at one by hand).
+    if (argc == 1) {
+        const sdl::Context context = sdl::Context(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+        if (!context.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL: %s\n", SDL_GetError());
+            return 1;
+        }
+        const sdl::NetContext netContext = sdl::NetContext();
+        if (!netContext.isValid()) {
+            fprintf(stderr, "Failed to initialize SDL_net: %s\n", SDL_GetError());
+            return 1;
+        }
+
+        return client(RelayConfig::HOST, RelayConfig::PORT);
+    }
+
     if (argc != 4) {
-        fprintf(stderr, "Usage: %s server/client ip port\n", argv[0]);
+        fprintf(stderr, "Usage: %s [server ip port | client ip port]\n", argv[0]);
         fprintf(stderr, "  (as a server, use 'any' as the ip to listen on every interface)\n");
+        fprintf(stderr, "  (run with no arguments at all to just play against the default relay)\n");
         return 1;
     }
     uint8_t netMode = 0;
