@@ -208,27 +208,26 @@ int client(const char *ip, Uint16 port) {
     uint8_t brush = 1;
 
     std::vector<Toggle> toggles = std::vector<Toggle>();
-    toggles.reserve(6);
+    toggles.reserve(7);
     std::function<void(Toggle &self)> toggleCallback = [&](Toggle &self) {
         self.state = true;
-        self.texture = TextureRegistry::getInstance().getAtlasHighlightedTexture();
+        self.uv.x = 1.0f / 3.0f;
         for (size_t i = 0; i < toggles.size(); i++) {
             if (&toggles[i] != &self) {
                 toggles[i].state = false;
-                toggles[i].texture = TextureRegistry::getInstance().getAtlasTexture();
+                toggles[i].uv.x = 0.0f;
             } else {
                 brush = static_cast<uint8_t>(i + 1);
             }
         }
     };
-    const float uvSize = 1.0f / 3.0f;
-    for (uint8_t i = 1; i < 7; i++) {
+    for (uint8_t i = 0; i < 7; i++) {
         Toggle &toggle = toggles.emplace_back(TextureRegistry::getInstance().getAtlasTexture(), toggleCallback);
-        const float uvX = std::fmodf(static_cast<float>(i), 3.0f) * uvSize;
-        const float uvY = std::floorf(static_cast<float>(i) / 3.0f) * uvSize;
-        toggle.uv = glm::vec4(uvX, uvY, uvSize, uvSize);
+        toggle.uv = glm::vec4(0.0f, 0.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f);
         toggle.size = glm::vec2(0.1f);
+        toggle.hsv = map_properties::BRICK_HSVS[i];
     }
+    toggleCallback(toggles[0]);
     std::function<void()> pushPrefabButtonCallback = [&]() {
         for (const std::array<uint8_t, Piece::width> &row : prefab) {
             for (const uint8_t cell : row) {
@@ -585,14 +584,30 @@ int client(const char *ip, Uint16 port) {
                     const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(posX, posY, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
                     BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
                     const uint8_t value = prefab[y][x];
-                    const float uvX = std::fmodf(static_cast<float>(value), 3.0f) * uvSize;
-                    const float uvY = std::floorf(static_cast<float>(value) / 3.0f) * uvSize;
-                    BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+                    
+                    BasicShader::getInstance().setUV(glm::vec4(0.0f, 2.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                    BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
                     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    if (value > 0) {
+                        BasicShader::getInstance().setUV(glm::vec4(0.0f, 0.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                        BasicShader::getInstance().setHSV(map_properties::BRICK_HSVS[value - 1]);
+                        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+                        BasicShader::getInstance().setUV(glm::vec4(0.0f, 1.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                        BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
+                        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    }
                 }
             }
             for (Toggle &toggle : toggles) {
+                // FIXME: That's pretty ugly, lol
+                toggle.uv.y = 0.0f;
                 toggle.draw(projectionViewMatrix);
+                toggle.uv.y = 1.0f / 3.0f;
+                HSV hsv = toggle.hsv;
+                toggle.hsv = HSV(0.0f, 0.0f, 0.0f);
+                toggle.draw(projectionViewMatrix);
+                toggle.hsv = hsv;
             }
             pushPrefabButton.draw(projectionViewMatrix);
         }

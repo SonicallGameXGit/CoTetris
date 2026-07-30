@@ -54,12 +54,13 @@ public:
     bool state = false;
     glm::vec2 position, size;
     glm::vec4 uv;
+    HSV hsv;
     GLuint texture;
     std::function<void(Toggle &self)> onToggle;
 
     Toggle(GLuint texture, std::function<void(Toggle &self)> onToggle) :
         position(), size(1.0f), uv(0.0f, 0.0f, 1.0f, 1.0f),
-        texture(texture),
+        hsv(0.0f, 0.0f, 1.0f), texture(texture),
         onToggle(onToggle)
     {}
     ~Toggle() = default;
@@ -87,6 +88,7 @@ public:
         const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(this->position, 0.0f)), glm::vec3(this->size, 1.0f));
         BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
         BasicShader::getInstance().setUV(this->uv);
+        BasicShader::getInstance().setHSV(this->hsv);
 
         glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     }

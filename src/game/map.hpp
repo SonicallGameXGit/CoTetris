@@ -9,6 +9,17 @@
 #include "../toolbox/texture.hpp"
 #include "piece.hpp"
 
+namespace map_properties {
+    static const HSV BRICK_HSVS[7] = {
+        HSV(0.0f, 0.0f, 0.0f),
+        HSV(24.0f, 0.0f, 0.0f),
+        HSV(48.0f, 0.0f, 0.0f),
+        HSV(112.0f, 0.0f, 0.0f),
+        HSV(180.0f, 0.0f, 0.0f),
+        HSV(-134.0f, 0.0f, 0.0f),
+        HSV(-90.0f, 0.0f, 0.0f),
+    };
+}
 class Map {
 public:
     static constexpr size_t width = 10;
@@ -215,19 +226,25 @@ public:
 
         const float cellSize = 2.0f / static_cast<float>(Map::height);
         const float gridX = (aspectRatio * 2.0f - static_cast<float>(Map::width) * cellSize) * 0.5f;
-        const float uvSize = 1.0f / 3.0f;
         for (size_t row = 0; row < Map::height; row++) {
             for (size_t col = 0; col < Map::width; col++) {
                 const float x = -aspectRatio + gridX + col * cellSize;
                 const float y = -1.0f + row * cellSize;
                 const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
                 BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
-
-                const float uvX = std::fmodf(static_cast<float>(this->grid[row][col]), 3.0f) * uvSize;
-                const float uvY = std::floorf(static_cast<float>(this->grid[row][col]) / 3.0f) * uvSize;
-                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
-
+                
+                BasicShader::getInstance().setUV(glm::vec4(0.0f, 2.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                if (this->grid[row][col] > 0) {
+                    BasicShader::getInstance().setUV(glm::vec4(0.0f, 0.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                    BasicShader::getInstance().setHSV(map_properties::BRICK_HSVS[this->grid[row][col] - 1]);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+                    BasicShader::getInstance().setUV(glm::vec4(0.0f, 1.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                    BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                }
             }
         }
         if (!this->piece.has_value()) { return; }
@@ -240,15 +257,16 @@ public:
                 const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
                 BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
 
-                const float uvX = std::fmodf(static_cast<float>(this->piece->getCell(row, col)), 3.0f) * uvSize;
-                const float uvY = std::floorf(static_cast<float>(this->piece->getCell(row, col)) / 3.0f) * uvSize;
-                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
+                BasicShader::getInstance().setUV(glm::vec4(0.0f, 0.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                BasicShader::getInstance().setHSV(map_properties::BRICK_HSVS[this->piece->getCell(row, col) - 1]);
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+                BasicShader::getInstance().setUV(glm::vec4(0.0f, 1.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
         }
         if (!this->ghost.has_value()) { return; }
-        glBindTexture(GL_TEXTURE_2D, TextureRegistry::getInstance().getAtlasTransparentTexture());
         for (size_t row = 0; row < Piece::height; row++) {
             for (size_t col = 0; col < Piece::width; col++) {
                 if (this->ghost->getCell(row, col) == 0) { continue; }
@@ -257,11 +275,13 @@ public:
                 const float y = -1.0f + (row + this->ghost->y) * cellSize;
                 const glm::mat4 modelMatrix = glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)), glm::vec3(cellSize, cellSize, 1.0f));
                 BasicShader::getInstance().setProjectionViewModelMatrix(projectionViewMatrix * modelMatrix);
+                
+                BasicShader::getInstance().setUV(glm::vec4(2.0f / 3.0f, 0.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                BasicShader::getInstance().setHSV(map_properties::BRICK_HSVS[this->ghost->getCell(row, col) - 1]);
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
-                const float uvX = std::fmodf(static_cast<float>(this->ghost->getCell(row, col)), 3.0f) * uvSize;
-                const float uvY = std::floorf(static_cast<float>(this->ghost->getCell(row, col)) / 3.0f) * uvSize;
-                BasicShader::getInstance().setUV(glm::vec4(uvX, uvY, uvSize, uvSize));
-
+                BasicShader::getInstance().setUV(glm::vec4(2.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f - 0.005f, 1.0f / 3.0f - 0.005f));
+                BasicShader::getInstance().setHSV(HSV(0.0f, 0.0f, 0.0f));
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
         }
